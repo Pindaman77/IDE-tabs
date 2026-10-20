@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.1.0-alpha.1 — unreleased
+## v0.1.0-alpha.1 — 2026-10-20
 
 The first IDE-tabs release: an early alpha for Windows 11, Cursor and VS Code.
 
