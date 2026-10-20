@@ -12,6 +12,7 @@ project keeps its own editor, agent chats and terminals.
 > **Early alpha** for **Windows 11**, supporting **Cursor** and **VS Code**. The download
 > is not code-signed yet, so Windows SmartScreen warns before the first start.
 
+- release has installer and portable option
 **[⬇ Download IDE-tabs](https://github.com/Pindaman77/IDE-tabs/releases)** · [Getting started](docs/getting-started.md) · [Known limitations](docs/known-limitations.md)
 
 ## What it does
