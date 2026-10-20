@@ -235,7 +235,8 @@ static partial class DesktopE2E
         Remember("verify activation",new { expected=expected.ToInt64(),strip=strip.ToInt64(),owner=GetWindow(strip,4).ToInt64() });
         try { await Until("Wrong foreground, column owner or workspace frame after switch",()=>GetForegroundWindow()==expected && GetWindow(strip,4)==expected && IsWindowVisible(strip) && FillsWorkspace(expected,strip),5000); }
         catch { Log("expected="+expected+" foreground="+GetForegroundWindow()+" owner="+GetWindow(strip,4)+" frame="+Json.Serialize(Frame(expected))+" column="+Json.Serialize(Bounds(strip))); throw; }
-        Check(WindowFromPoint(RowPoint(strip,0))==strip,"Active window covers its column");
+        // Restoring from maximized can put the editor over its column for a moment.
+        await Until("Active window covers its column",()=>WindowFromPoint(RowPoint(strip,0))==strip,2000);
     }
     static async Task<List<IntPtr>> ReadOrder(IntPtr strip, int count, IEnumerable<IntPtr> expected)
     {
