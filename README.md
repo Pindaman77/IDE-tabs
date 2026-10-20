@@ -50,9 +50,10 @@ project keeps its own editor, agent chats and terminals.
 
 ## Get started
 
-1. Download the latest prerelease from [Releases](https://github.com/Pindaman77/IDE-tabs/releases).
-2. Unzip it to a folder of your own, for example `%LocalAppData%\Programs\IDE-tabs`,
-   and run `IDE-tabs.exe`. On the SmartScreen warning, choose **More info → Run anyway**.
+1. Download `IDE-tabs-<version>-setup.exe` from the latest prerelease on
+   [Releases](https://github.com/Pindaman77/IDE-tabs/releases).
+2. Run it. It installs for your account only, without administrator rights, and starts
+   IDE-tabs. On the SmartScreen warning, choose **More info → Run anyway**.
 3. Open your projects in Cursor or VS Code, each in its own window. They join the
    workspace.
 
@@ -63,7 +64,7 @@ including updating and uninstalling, is in [Getting started](docs/getting-starte
 
 | Working now | Planned |
 | --- | --- |
-| Automatic workspaces for Cursor and VS Code | Installer, and signed downloads |
+| Automatic workspaces for Cursor and VS Code | Signed downloads, and updates from inside the app |
 | Project sidebar: expanded, collapsed, hidden | Windsurf and VSCodium, once tested |
 | One native Alt+Tab entry that returns to your project | Live preview in the Alt+Tab entry |
 | Fitted layout that survives maximize, snap and drag | Remembering windows taken out of the workspace across restarts |

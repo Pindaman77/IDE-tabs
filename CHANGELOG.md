@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.0-alpha.2 — 2026-10-20
+
+- A setup installs IDE-tabs for your account without administrator rights, with a Start
+  menu shortcut and an entry in Installed apps. Running a newer setup updates it in place.
+  The ZIP stays available as the portable copy.
+
 ## v0.1.0-alpha.1 — 2026-10-20
 
 First early alpha for Windows 11.
