@@ -54,14 +54,9 @@ $section = if ($end -lt 0) { $changelog[($start + 1)..($changelog.Length - 1)] }
 @"
 $(($section -join "`n").Trim())
 
-### Download
+**Install:** download ``$name.zip``, unzip, run ``IDE-tabs.exe``. It isn't code-signed yet, so Windows may ask first: **More info, then Run anyway**.
 
-Download ``$name.zip``, unzip it and run ``IDE-tabs.exe``. The download is not code-signed:
-Windows SmartScreen asks first: choose **More info**, then **Run anyway**. Check the ZIP against
-``SHA256SUMS.txt``: ``Get-FileHash .\$name.zip -Algorithm SHA256``.
-
-Read the [known limitations](https://github.com/Pindaman77/IDE-tabs/blob/main/docs/known-limitations.md)
-before relying on this early alpha.
+See [known limitations](https://github.com/Pindaman77/IDE-tabs/blob/main/docs/known-limitations.md)
 "@ | ForEach-Object { [IO.File]::WriteAllText((Join-Path $OutputDirectory 'release-notes.md'), $_, $utf8) }
 
 Remove-Item $stage -Recurse -Force
