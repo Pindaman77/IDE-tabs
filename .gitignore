@@ -1,0 +1,19 @@
+Release/
+Debug/
+**/bin/
+**/obj/
+
+*.sdf
+/UpgradeLog.htm
+/.vs/WindowTabs/v15/Server/sqlite3/db.lock
+/.vs/WindowTabs/v15
+.vs
+WtProgram/obj
+CppProperties.json
+
+# NuGet packages are restored to the user cache (PackageReference), never into the repository.
+packages/
+tests/coverage/
+
+# Release packages from build/Package-Release.ps1.
+dist/

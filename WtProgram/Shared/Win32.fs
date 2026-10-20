@@ -1,0 +1,714 @@
+﻿namespace Bemo
+open System
+open System.Drawing
+open System.IO
+open System.Runtime.InteropServices
+open System.Text
+open System.Windows.Forms
+
+type MouseAction =
+    | MouseDown
+    | MouseUp
+    | MouseDblClick
+
+type MouseButton =
+    | MouseLeft
+    | MouseMiddle
+    | MouseRight
+
+type MouseEvent =
+    | MouseMove of Pt
+    | MouseClick of (Pt * MouseButton * MouseAction)
+    | MouseLeave
+
+type OSMouse = {
+    pt : Pt
+    btns : Set2<MouseButton>
+    }
+
+and OSWindowPlacement = {
+    flags : int
+    showCmd: int
+    ptMinPosition: Pt
+    ptMaxPosition: Pt
+    rcNormalPosition: Rect
+}
+
+type WinEvent =
+    | EVENT_SYSTEM_FOREGROUND = 0x0003
+    | EVENT_SYSTEM_MOVESIZESTART = 0x000A
+    | EVENT_SYSTEM_MOVESIZEEND = 0x000B
+    | EVENT_SYSTEM_SWITCHSTART = 0x0014
+    | EVENT_SYSTEM_SWITCHEND = 0x0015
+    | EVENT_OBJECT_CREATE = 0x8000
+    | EVENT_OBJECT_DESTROY = 0x8001
+    | EVENT_OBJECT_SHOW = 0x8002
+    | EVENT_OBJECT_HIDE = 0x8003
+    | EVENT_OBJECT_REORDER = 0x8004
+    | EVENT_OBJECT_LOCATIONCHANGE = 0x800B
+    | EVENT_OBJECT_NAMECHANGE = 0x800C
+    | EVENT_OBJECT_CLOAKED = 0x8017
+    | EVENT_OBJECT_UNCLOAKED = 0x8018
+    | EVENT_SYSTEM_MINIMIZESTART = 0x0016
+    | EVENT_SYSTEM_MINIMIZEEND = 0x0017
+
+type ShellEvent =
+    | HSHELL_WINDOWCREATED = 1
+    | HSHELL_WINDOWDESTROYED = 2
+    | HSHELL_ACTIVATESHELLWINDOW = 3
+    | HSHELL_WINDOWACTIVATED = 4
+    | HSHELL_GETMINRECT = 5
+    | HSHELL_REDRAW = 6
+    | HSHELL_TASKMAN = 7
+    | HSHELL_LANGUAGE = 8
+    | HSHELL_SYSMENU = 9
+    | HSHELL_ENDTASK = 10
+    | HSHELL_FLASH = 0x8006
+    //sent for maximized windows
+    | HSHELL_RUDEAPPACTIVATED = 0x8004
+
+type IWindow =
+    abstract member hwnd : IntPtr
+
+type OS()= 
+    let Cell = CellScope()
+
+    member this.getTaskbar() = if this.isWin7OrHigher then Some(ShellApi.GetTaskbar()) else None
+    
+    member this.isWin7OrHigher =
+        // Major > 6 matters once the manifest declares a supportedOS: Windows
+        // then reports 10.0, and a plain "Minor >= 1" would read as false.
+        let version = System.Environment.OSVersion.Version
+        version.Major > 6 || (version.Major = 6 && version.Minor >= 1)
+    
+    member this.lockForeground() = WinUserApi.LockSetForegroundWindow(1)
+    member this.unlockForeground() = WinUserApi.LockSetForegroundWindow(2).ignore
+
+    member this.nullWindow = this.windowFromHwnd(IntPtr.Zero)
+
+    member this.pid = WinBaseApi.GetCurrentProcessId()
+
+    member this.createWindow wndProc style exStyle =
+        let hModule = WinBaseApi.GetModuleHandle(IntPtr.Zero)
+        let className = Guid.NewGuid().ToString()
+        let wndProcDelegate = 
+            let wndProc hwnd msg wParam lParam =
+                let m = {hwnd=hwnd; msg=msg; wParam=wParam; lParam=lParam}
+                wndProc(m)
+            WNDPROC(wndProc)
+        let delHandle = GCHandle.Alloc(wndProcDelegate)
+        let mutable wc = WNDCLASS()
+        wc.style <- ClassStyles.CS_DBLCLKS
+        wc.lpfnWndProc <- wndProcDelegate
+        wc.cbClsExtra <- 0
+        wc.cbWndExtra <- 0
+        wc.hInstance <- hModule
+        wc.hIcon <- IntPtr.Zero
+        wc.hCursor <- WinUserApi.LoadCursor(IntPtr.Zero, CursorIds.IDC_ARROW)
+        wc.hbrBackground <- IntPtr.Zero
+        wc.lpszMenuName <- ""
+        wc.lpszClassName <- className
+        WinUserApi.RegisterClass(ref wc) |> ignore
+
+        let hwnd = WinUserApi.CreateWindowEx(
+            exStyle,
+            className,
+            "",
+            style,
+            0, 0,
+            0, 0,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            hModule,
+            IntPtr.Zero
+            )
+
+        let mutable disposed = 0
+        { 
+            new IWindow with
+                member this.hwnd = hwnd
+            interface IDisposable with
+                member this.Dispose() =
+                    if Threading.Interlocked.Exchange(&disposed,1)=0 then
+                        WinUserApi.DestroyWindow(hwnd).ignore
+                        WinUserApi.UnregisterClass(className, hModule).ignore
+                        delHandle.Free()
+        }
+
+
+    member this.windowFromHwnd = Cell.cacheThis this <| fun(hwnd) -> Window(hwnd, this)
+
+    member this.registerShellHooks proc : IDisposable =
+        let shellHookMsg = WinUserApi.RegisterWindowMessage("SHELLHOOK")
+        let handler (msg:Win32Message) =
+            if msg.msg = shellHookMsg then
+                let hwnd = msg.lParam
+                let shellEvent = enum<ShellEvent>(int(msg.wParam))
+                proc(hwnd,shellEvent)
+            msg.def()
+
+        let iWindow = this.createWindow handler 0 0
+        let window = this.windowFromHwnd(iWindow.hwnd)
+        window.registerShellHookWindow()
+        iWindow :?> IDisposable
+
+    member this.registerKeyboardLLHook(callback) =
+        let proc nCode (wParam:IntPtr) lParam = 
+            let hookStruct = unbox<KBDLLHOOKSTRUCT>(Marshal.PtrToStructure(lParam, typeof<KBDLLHOOKSTRUCT>))
+            match callback(wParam, hookStruct) with
+            | Some(rv) -> rv
+            | None -> WinUserApi.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam)
+        let del = HOOKPROC(proc)
+        let handle = GCHandle.Alloc(del)
+        let hookId = WinUserApi.SetWindowsHookEx(
+            WindowHookTypes.WH_KEYBOARD_LL, 
+            del, 
+            WinBaseApi.GetModuleHandle(IntPtr.Zero),
+            0)
+        let mutable disposed = 0
+        let dispose() =
+            // Both plugin shutdown and the scope can release the same hook.
+            if Threading.Interlocked.Exchange(&disposed,1)=0 then
+                WinUserApi.UnhookWindowsHookEx(hookId).ignore
+                handle.Free()
+        { 
+            new Object() with
+                override this.Finalize() = 
+                    dispose()
+            interface IDisposable with
+                member this.Dispose() =
+                    GC.SuppressFinalize(this)
+                    dispose()
+        }
+
+    // Caller owns the returned region and should dispose it. The accumulator and
+    // the per-monitor regions are dead once union has produced the next one.
+    member this.screenRegion =
+        Mon.all.fold (new Rgn()) <| fun rgn mon ->
+            use previous = rgn
+            use monitorRegion = new Rgn(mon.displayRect)
+            previous.union(monitorRegion)
+
+    member this.isOnScreen (bounds:Rect) =
+        use region = this.screenRegion
+        region.containsRect(bounds)
+
+    member this.capture =
+        let hwnd = WinUserApi.GetCapture()
+        if hwnd = IntPtr.Zero then None
+        else Some(hwnd)
+    
+    member this.foreground =
+        this.windowFromHwnd(WinUserApi.GetForegroundWindow())
+
+    member this.windowAtPt (pt:Pt) =
+        this.windowFromHwnd(WinUserApi.WindowFromPoint(pt.POINT))
+
+    member this.windowsInZorder = 
+        List2(List.ofArray (Win32Helper.GetWindowsInZOrder())).map(this.windowFromHwnd)
+
+    member this.windowZorders =
+        Map2(this.windowsInZorder.enumerate.map(fun(z, window) -> window.hwnd,z))
+
+    member this.setZorder(hwnds:List2<IntPtr>) =
+        let hdswp = ref(WinUserApi.BeginDeferWindowPos(hwnds.length))
+        hwnds.pairwise.iter <| fun (hwndPrev, hwnd) ->
+            hdswp := WinUserApi.DeferWindowPos(!hdswp,
+                hwnd,
+                hwndPrev, 0, 0, 0, 0,
+                SetWindowPosFlags.SWP_NOOWNERZORDER |||
+                SetWindowPosFlags.SWP_NOMOVE |||
+                SetWindowPosFlags.SWP_NOSIZE |||
+                SetWindowPosFlags.SWP_NOACTIVATE)
+        WinUserApi.EndDeferWindowPos(!hdswp).ignore
+
+
+    member this.setWinEventHook(min:WinEvent, max:WinEvent, proc, pid, tid) =
+        let proc hWinEventHook event hwnd idObject idChild dwEventThread dwmsEventTime =
+            if idObject = IntPtr.Zero then
+                proc hWinEventHook event hwnd idObject idChild dwEventThread dwmsEventTime
+
+        let del = WINEVENTPROC(proc)
+        let delHandle = GCHandle.Alloc(del)
+        let hhook = WinUserApi.SetWinEventHook(int(min), int(max), IntPtr.Zero, del, pid, tid, 0)
+        let mutable disposed = 0
+        { 
+            new IDisposable with
+            member this.Dispose() =
+                if Threading.Interlocked.Exchange(&disposed,1)=0 then
+                    try
+                        WinUserApi.UnhookWinEvent(hhook).ignore
+                        delHandle.Free()
+                    with _ -> ()
+        }
+
+    member this.dosDevices = 
+        let driveLetters = List2([0..25]).map(fun i -> char(int('A') + i))
+        driveLetters.choose <| fun driveLetter ->
+            let pathLength = 512
+            let path = StringBuilder(pathLength)
+            if WinBaseApi.QueryDosDevice(driveLetter.ToString() + ":", path, pathLength) then
+                Some(path.ToString(), driveLetter)
+            else
+                None
+
+    member this.setSingleWinEvent (event:WinEvent) proc =
+        let proc hWinEventHook _ hwnd idObject idChild dwEventThread dwmsEventTime =
+            proc(hwnd)
+        this.setWinEventHook(event, event, proc, 0, 0)
+
+and
+    Window(hwnd:nativeint, os:OS) =
+    let Cell = CellScope()
+
+    member this.hwnd = hwnd
+    
+    member this.mon = Mon.fromHwnd(hwnd)
+
+    override this.ToString() = this.hwnd.ToString()
+
+    member this.pid = Cell.cacheProp this <| fun() -> Pid(Win32Helper.GetWindowProcessId(hwnd))
+
+    member this.tid = Win32Helper.GetWindowThreadId(hwnd)
+
+    member this.zorder = os.windowsInZorder.tryFindIndex(fun w -> w.hwnd = hwnd).def(9999)
+
+    member this.dwmPublishIconicLivePreview (image:Img) =
+        if os.isWin7OrHigher then
+            let mutable ptClient = POINT(0, 0)
+            let hbitmap = image.hbitmap
+            try
+                let result = DwmApi.DwmSetIconicLivePreviewBitmap(hwnd, hbitmap, ref ptClient, 0)
+                if result<0 then Diagnostics.Trace.TraceWarning("DWM Peek bitmap rejected: HRESULT=0x{0:X8}, bitmap={1}, client={2}",result,image.size,this.clientSize)
+                result
+            finally WinGdiApi.DeleteObject(hbitmap) |> ignore
+        else 0
+
+    member this.dwmSetIconicLivePreview (image:Img) = this.dwmPublishIconicLivePreview image |> ignore
+
+    member this.dwmSetIconicThumbnail (image:Img) =
+        if os.isWin7OrHigher then
+            let hbitmap = image.hbitmap
+            try DwmApi.DwmSetIconicThumbnail(hwnd, hbitmap, 0) |> ignore
+            finally WinGdiApi.DeleteObject(hbitmap) |> ignore
+
+    member this.style = WinUserApi.GetWindowLong(hwnd, WindowLongFieldOffset.GWL_STYLE)
+    member this.styleEx = WinUserApi.GetWindowLong(hwnd, WindowLongFieldOffset.GWL_EXSTYLE)
+
+    member this.hasStyle style = 
+        Win32Helper.IntPtrAnd(this.style, nativeint(style)) = nativeint(style)
+
+    member this.hasStyleEx style = 
+        Win32Helper.IntPtrAnd(this.styleEx, nativeint(style)) = nativeint(style)
+
+    member this.ptToClient (pt:Pt) = 
+        let pt = pt.POINT
+        let pt = Win32Helper.ScreenToClient(hwnd, pt)
+        pt.ToPoint().Pt
+
+    member this.ptToScreen (pt:Pt) =
+        let pt = pt.POINT
+        let pt = Win32Helper.ClientToScreen(hwnd, pt)
+        pt.ToPoint().Pt
+
+    member this.isWindow = WinUserApi.IsWindow(hwnd)
+
+    member this.isVisible = WinUserApi.IsWindowVisible(hwnd)
+
+    member this.isMinimized = WinUserApi.IsIconic(hwnd)
+
+    member this.showWindow(cmd:int) = WinUserApi.ShowWindow(hwnd, cmd).ignore
+
+    member this.isMaximized = WinUserApi.IsZoomed(hwnd)
+
+    member this.isOwned = WinUserApi.GetWindowLong(hwnd, WindowLongFieldOffset.GWL_HWNDPARENT) <> IntPtr.Zero
+
+    member this.bounds = Win32Helper.GetWindowRectangle(hwnd).Rect
+
+    /// What the user sees: bounds less the invisible resize borders, for drawing next to the window.
+    member this.visibleBounds = Win32Helper.GetVisibleWindowRectangle(hwnd).Rect
+
+    member this.size = this.bounds.size
+
+    /// DWM limits Peek bitmaps to the client area, which can be smaller than the outer bounds.
+    member this.clientSize =
+        let mutable rect = RECT()
+        if WinUserApi.GetClientRect(hwnd,&rect) then rect.Rect.size else Sz(0,0)
+    
+    member this.location = this.bounds.location
+
+    member this.uiThreadInfo = Win32Helper.GetGUIThreadInfo(this.tid)
+
+    member this.isInMoveSize = this.uiThreadInfo.hwndMoveSize = hwnd
+
+    member private this.packagedIcon iconType =
+        // UWP apps behind ApplicationFrameHost publish no window icon; use their package icon
+        // (cached by AppIcons, so callers never dispose it).
+        if this.className = "ApplicationFrameWindow" then
+            let size = if iconType = IconTypeCodes.ICON_BIG then SystemInformation.IconSize.Width else SystemInformation.SmallIconSize.Width
+            AppIcons.GetPackagedWindowIcon(hwnd, size)
+        else null
+
+    member this.icon iconType =
+        let packaged = this.packagedIcon iconType
+        if not (isNull packaged) then packaged
+        else Ico.fromHandle(Win32Helper.GetWindowIcon(hwnd, iconType)).def(System.Drawing.SystemIcons.Application)
+
+    member this.copyIcon iconType =
+        let packaged = this.packagedIcon iconType
+        if not(isNull packaged) then packaged.Clone() :?> Icon
+        else
+            match Ico.fromHandle(Win32Helper.GetWindowIcon(hwnd, iconType)) with
+            | Some icon -> icon
+            | None -> System.Drawing.SystemIcons.Application.Clone() :?> Icon
+
+    member this.iconSmall = this.icon IconTypeCodes.ICON_SMALL
+
+    member this.iconBig = this.icon IconTypeCodes.ICON_BIG
+
+    member this.setIcons(icon:Icon) =
+        for size in [IconTypeCodes.ICON_SMALL;IconTypeCodes.ICON_BIG] do
+            WinUserApi.SendMessage(hwnd,WindowMessages.WM_SETICON,IntPtr(size),icon.Handle) |> ignore
+
+    member this.text = Win32Helper.GetWindowText(hwnd)
+        
+    member this.prevZorder =
+        os.windowFromHwnd(WinUserApi.GetWindow(hwnd, GetWindowConstants.GW_HWNDPREV))
+
+    member this.placement = 
+        let wpStruct = Win32Helper.GetWindowPlacement(hwnd)
+        {
+            flags = wpStruct.flags
+            showCmd = wpStruct.showCmd
+            ptMinPosition = wpStruct.ptMinPosition.Pt
+            ptMaxPosition = wpStruct.ptMaxPosition.Pt
+            rcNormalPosition = wpStruct.rcNormalPosition.Rect
+        }
+
+    member this.setPlacement wp =
+        let mutable wpStruct = WINDOWPLACEMENT()
+        wpStruct.length <- Marshal.SizeOf(wpStruct)
+        wpStruct.flags <- wp.flags
+        wpStruct.showCmd <- wp.showCmd
+        wpStruct.ptMinPosition <- wp.ptMinPosition.POINT
+        wpStruct.ptMaxPosition <- wp.ptMaxPosition.POINT
+        wpStruct.rcNormalPosition <- wp.rcNormalPosition.RECT
+        WinUserApi.SetWindowPlacement(hwnd, ref wpStruct) |> ignore
+
+    member this.setForeground(force) =
+        if force then
+            let foregroundWindow = WinUserApi.GetForegroundWindow()
+            let foregroundTID = Win32Helper.GetWindowThreadId(foregroundWindow)
+            let targetTID = Win32Helper.GetWindowThreadId(hwnd)
+            if foregroundTID = targetTID then
+                WinUserApi.SetForegroundWindow(hwnd).ignore
+            else
+                //this is the most reliable way to ensure we can set foreground, case #729
+                //does not matter what key code we send
+                WinUserApi.keybd_event(0x3A, 0, 0, 0)              
+                WinUserApi.keybd_event(0x3A, 0, SendInputConstants.KEYEVENTF_KEYUP, 0)
+                WinUserApi.SetForegroundWindow(hwnd).ignore
+        else
+            WinUserApi.SetForegroundWindow(hwnd).ignore
+
+    member this.minimize() = WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_MINIMIZE).ignore
+    
+    member this.restore() = 
+        WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_RESTORE).ignore
+
+    member this.close() = WinUserApi.PostMessage(hwnd, WindowMessages.WM_SYSCOMMAND, IntPtr(SystemMenuCommandValues.SC_CLOSE), IntPtr.Zero).ignore
+
+    member this.setForegroundOrRestore(force) =
+        if this.isMinimized then
+            WinUserApi.ShowWindow(this.hwnd, ShowWindowCommands.SW_RESTORE).ignore
+        else 
+            this.setForeground(force)
+    
+    member this.setCapture() = WinUserApi.SetCapture(hwnd).ignore
+
+    member this.releaseCapture() = if this.hasCapture then WinUserApi.ReleaseCapture().ignore
+
+    member this.hasCapture = WinUserApi.GetCapture() = hwnd
+
+    member this.bringToTop() = 
+        WinUserApi.BringWindowToTop(hwnd).ignore
+
+    /// Above every other window, its owners with it, without activating it. Activation alone can
+    /// leave a window whose owner was set by another process (a combined taskbar's preview) under
+    /// other windows: Windows raised the owner, already on top, and not the window.
+    member this.raise() =
+        WinUserApi.SetWindowPos(hwnd, WindowHandleTypes.HWND_TOP, 0, 0, 0, 0,
+            SetWindowPosFlags.SWP_NOMOVE ||| SetWindowPosFlags.SWP_NOSIZE ||| SetWindowPosFlags.SWP_NOACTIVATE) |> ignore
+    
+    member this.insertAfter(hwndInsertAfter:IntPtr) =
+        WinUserApi.SetWindowPos(hwnd,
+            hwndInsertAfter, 0, 0, 0, 0,
+            SetWindowPosFlags.SWP_NOOWNERZORDER |||
+            SetWindowPosFlags.SWP_NOMOVE |||
+            SetWindowPosFlags.SWP_NOSIZE |||
+            SetWindowPosFlags.SWP_NOACTIVATE) |> ignore
+
+    member this.makeTopMost() =
+        this.insertAfter(WindowHandleTypes.HWND_TOPMOST)
+
+    member this.makeNotTopMost() =
+        if this.isTopMost then
+            this.insertAfter(WindowHandleTypes.HWND_NOTOPMOST)
+
+    member this.isTopMost = this.hasStyleEx WindowsExtendedStyles.WS_EX_TOPMOST
+
+    /// A window of an elevated program, such as the frame another tab tool keeps over each window,
+    /// refuses to be the reference, so this goes below the nearest window above it that accepts.
+    member this.insertAfter(prev:Window) =
+        let rec place (after:IntPtr) =
+            let placed =
+                WinUserApi.SetWindowPos(hwnd,
+                    after, 0, 0, 0, 0,
+                    SetWindowPosFlags.SWP_NOOWNERZORDER |||
+                    SetWindowPosFlags.SWP_NOMOVE |||
+                    SetWindowPosFlags.SWP_NOSIZE |||
+                    SetWindowPosFlags.SWP_NOACTIVATE)
+            if not placed && after <> IntPtr.Zero then
+                let above = WinUserApi.GetWindow(after, GetWindowConstants.GW_HWNDPREV)
+                if above <> hwnd then place above
+        place prev.hwnd
+
+    member this.parent = os.windowFromHwnd(WinUserApi.GetWindowLong(hwnd, WindowLongFieldOffset.GWL_HWNDPARENT))
+
+    member this.setParent (parent:Window) =
+        if this.parent.hwnd <> parent.hwnd then
+            WinUserApi.SetWindowLong(hwnd, WindowLongFieldOffset.GWL_HWNDPARENT, parent.hwnd).ignore
+            this.insertAfter(parent.prevZorder)
+
+    /// Changes the owner but leaves this window where it is in the z-order.
+    member this.setOwner (owner:Window) =
+        if this.parent.hwnd <> owner.hwnd then
+            WinUserApi.SetWindowLong(hwnd, WindowLongFieldOffset.GWL_HWNDPARENT, owner.hwnd).ignore
+
+    member private this.minimizeAnchor =
+        // MonitorFromWindow remembers the pre-minimize frame, including a maximized
+        // window moved away from the monitor holding its normal restore rectangle.
+        let screen = Screen.FromHandle(hwnd)
+        let x = screen.Bounds.Left + (screen.Bounds.Width-SystemInformation.MinimizedWindowSize.Width)/2
+        let y =
+            if Screen.AllScreens |> Array.exists(fun other -> other.Bounds.Contains(x,screen.Bounds.Bottom)) then
+                SystemInformation.VirtualScreen.Bottom
+            else screen.Bounds.Bottom
+        let screenPoint = Pt(x,y)
+        let workspacePoint =
+            Pt(x,screen.WorkingArea.Bottom-SystemInformation.MinimizedWindowSize.Height)
+                .sub(Pt(screen.WorkingArea.Left-screen.Bounds.Left,screen.WorkingArea.Top-screen.Bounds.Top))
+        screenPoint,workspacePoint
+
+    member this.needsMinimizeAnchor =
+        this.isVisible && not this.isMinimized && this.parent.pid.isCurrentProcess && this.placement.ptMinPosition<>snd this.minimizeAnchor
+
+    /// Set the destination before minimizing, so both animations use the same monitor.
+    member this.prepareMinimizeAnchor(isCurrent:unit -> bool) =
+        if isCurrent() && this.needsMinimizeAnchor then
+            let bounds = this.bounds
+            let previous = this.prevZorder.hwnd
+            let wp = this.placement
+            let _,anchor = this.minimizeAnchor
+            let normalBounds =
+                let screen = Screen.FromHandle(hwnd)
+                let restoreScreen = Screen.FromRectangle(wp.rcNormalPosition.Rectangle)
+                if this.isMaximized && screen.DeviceName<>restoreScreen.DeviceName then
+                    // Windows rejects a minimize destination on a different monitor from
+                    // the normal restore frame, even while the maximized frame is there.
+                    wp.rcNormalPosition.move(screen.Bounds.Left-restoreScreen.Bounds.Left,screen.Bounds.Top-restoreScreen.Bounds.Top)
+                else wp.rcNormalPosition
+            this.setPlacement({
+                wp with
+                    flags=wp.flags ||| WindowPlacementFlags.WPF_SETMINPOSITION
+                    ptMinPosition=anchor
+                    rcNormalPosition=normalBounds
+                    showCmd=if wp.showCmd=ShowWindowCommands.SW_SHOWNORMAL then ShowWindowCommands.SW_SHOWNOACTIVATE else wp.showCmd})
+            if isCurrent() then
+                // WINDOWPLACEMENT remembers the unsnapped restore rectangle.
+                if wp.showCmd=ShowWindowCommands.SW_SHOWNORMAL && this.bounds<>bounds then this.move(bounds)
+                if isCurrent() && not this.isMinimized && previous<>IntPtr.Zero && WinUserApi.IsWindow(previous) then this.insertAfter(previous)
+
+    /// Owned minimized windows otherwise leave a small title bar above the taskbar.
+    member this.parkIfMinimized() =
+        let bar = this.bounds
+        if this.isMinimized && this.parent.pid.isCurrentProcess then
+            let anchor,_ = this.minimizeAnchor
+            if bar.location<>anchor then
+                WinUserApi.SetWindowPos(hwnd, IntPtr.Zero, anchor.x, anchor.y, 0, 0,
+                SetWindowPosFlags.SWP_NOSIZE ||| SetWindowPosFlags.SWP_NOZORDER ||| SetWindowPosFlags.SWP_NOACTIVATE).ignore
+
+    member this.showNoActivate() = WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_SHOWNOACTIVATE).ignore
+
+    member this.update(image:Img, location:Pt, alpha) =       
+        use imageWithBg = new Bitmap(image.width, image.height)
+        do
+            use gfx = Graphics.FromImage(imageWithBg)
+            use brush = new SolidBrush(Color.Transparent)
+            gfx.FillRectangle(brush, new Rectangle(Point.Empty, image.size.Size))
+            gfx.DrawImage(image.bitmap, Point.Empty)
+        Win32Helper.UpdateLayeredWindow(hwnd, location.Point, imageWithBg, alpha)
+        this.showNoActivate()
+    
+    member this.updateLocation(location:Pt) =       
+        Win32Helper.UpdateLayeredWindow(hwnd, location.Point)
+
+    member this.hide() = WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_HIDE) |> ignore
+
+    member this.destroy() = 
+        WinUserApi.DestroyWindow(hwnd).ignore
+
+    member this.defWndProc(msg, wParam, lParam) = WinUserApi.DefWindowProc(hwnd, msg, wParam, lParam)
+        
+    member this.setAppId appId = Win32Helper.SetWindowAppId(hwnd, appId) |> ignore
+    
+    member this.dwmInvalidateIconicBitmaps() = 
+        if os.isWin7OrHigher then
+            DwmApi.DwmInvalidateIconicBitmaps(hwnd) |> ignore
+
+    member this.dwmSetAttribute attribute value =
+        if os.isWin7OrHigher then
+            let mutable value = value
+            DwmApi.DwmSetWindowAttribute(
+                hwnd, 
+                attribute,
+                ref value,
+                Marshal.SizeOf(typeof<int>)) |> ignore
+
+    member this.move (bounds:Rect) =
+        WinUserApi.MoveWindow(
+            hwnd,
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
+            true) |> ignore
+
+    member this.setText text = WinUserApi.SetWindowText(hwnd, text) |> ignore
+    
+    member this.className = Win32Helper.GetClassName(hwnd)
+
+    member this.isConsoleWindow = this.className = "ConsoleWindowClass"
+
+    member this.isAltTabWindow =
+        WinUserApi.IsWindowVisible(hwnd) &&
+        this.isOwned.not &&
+        int(this.styleEx) &&& WindowsExtendedStyles.WS_EX_TOOLWINDOW = 0 &&
+        not (WindowCloaking.IsHiddenOnCurrentDesktop hwnd)
+    
+    member this.registerShellHookWindow() = WinUserApi.RegisterShellHookWindow(this.hwnd) |> ignore 
+
+    member this.registerHotKey(id, fsModifiers, vk, noRepeat) =  
+        let fsModifiers = 
+            if noRepeat && os.isWin7OrHigher then fsModifiers ||| HotKeyConstants.MOD_NOREPEAT
+            else fsModifiers
+        WinUserApi.RegisterHotKey(hwnd, id, fsModifiers, vk)
+
+    member this.unregisterHotKey(id) =
+        WinUserApi.UnregisterHotKey(hwnd, id)
+
+    member this.setWinEventHook (event:WinEvent) handler =
+        let winEventProc hWinEventHook event _hwnd idObject idChild dwEventThread dwmsEventTime =
+            if hwnd = _hwnd then 
+                handler()
+        let pid,tid =
+            //console winevents come from CONHOST.exe on windows 7, a different
+            //pid/tid than the window owner so can't filter on pid tid
+            if this.isConsoleWindow then 0,0 else this.pid.pid, this.tid
+        os.setWinEventHook(event, event, winEventProc, pid, tid)
+
+    member this.trackMouseLeave() =
+        let mutable tme = TRACKMOUSEEVENT()
+        tme.cbSize <- Marshal.SizeOf(tme)
+        tme.dwFlags <- TrackMouseEventFlags.TME_LEAVE
+        tme.hwndTrack <- hwnd
+        WinUserApi.TrackMouseEvent(ref tme) |> ignore
+
+    member this.hideOffScreen (size:Sz option) =
+        let corners = Mon.all.map <| fun monitor -> monitor.workRect.BR.sub(monitor.workRect.location)
+        let corner = corners.fold (Pt()) <| fun maxCorner corner ->
+            if maxCorner.x < corner.x then maxCorner else corner
+
+        let corner = corners.fold corner <| fun maxCorner corner ->
+            if  maxCorner.x = corner.x && 
+                maxCorner.y < corner.y then
+                maxCorner
+            else
+                corner
+        let corner = Pt(corner.x-1, corner.y-1)
+        this.setPlacement({
+            this.placement with
+                showCmd = ShowWindowCommands.SW_SHOWNOACTIVATE
+                rcNormalPosition = Rect(
+                    corner,
+                    if size.IsSome then size.Value else this.placement.rcNormalPosition.size
+                )
+        }) 
+
+    override this.Equals(yobj) =
+        match yobj with
+        | :? Window as yobj -> this.hwnd = yobj.hwnd
+        | _ -> false
+    override this.GetHashCode() = hash this.hwnd
+    interface System.IComparable with
+      member this.CompareTo yobj =
+          match yobj with
+          | :? Window as yobj -> compare this.hwnd yobj.hwnd
+          | _ -> failwith "cannot compare values of different types"
+
+and Pid(pid:int) =
+    let os = OS()
+    let Cell = CellScope()
+
+    member this.pid = pid
+    
+    member this.isCurrentProcess = this.pid = os.pid
+
+    member this.canQueryProcess = Cell.cacheProp this <| fun() ->
+        let hProcess = WinBaseApi.OpenProcess(ProcessAccessRights.PROCESS_QUERY_INFORMATION, false, this.pid)
+        let result = hProcess <> IntPtr.Zero
+        WinBaseApi.CloseHandle(hProcess) |> ignore
+        result
+
+    member private this.processKernelPath = 
+        let hProcess = WinBaseApi.OpenProcess(ProcessAccessRights.PROCESS_QUERY_INFORMATION, false, this.pid)
+        let size = 1024
+        let sb = StringBuilder(size)
+        Psapi.GetProcessImageFileName(hProcess, sb, size) |> ignore
+        let processPath = sb.ToString()
+        WinBaseApi.CloseHandle(hProcess) |> ignore
+        processPath
+
+    member this.processPath = Cell.cacheProp this <| fun() ->
+        let path = os.dosDevices.tryPick <| fun (device, drive) ->
+            if this.processKernelPath.StartsWith(device) then
+                Some(this.processKernelPath.Replace(device, drive.ToString() + ":"))
+            else
+                None
+        path.def(this.processKernelPath)
+
+    member this.exeName = Path.GetFileName(this.processPath).ToLower()
+
+    /// The program's own description (e.g. "Windows Explorer"), or its file name without ".exe".
+    member this.appName = Cell.cacheProp this <| fun() ->
+        let description =
+            try System.Diagnostics.FileVersionInfo.GetVersionInfo(this.processPath).FileDescription
+            with _ -> null
+        if String.IsNullOrWhiteSpace description then Path.GetFileNameWithoutExtension(this.processPath)
+        else description.Trim()
+
+and Win32Message = {
+    hwnd : IntPtr
+    msg : int
+    wParam : nativeint
+    lParam : nativeint
+    } with
+    member this.def() = WinUserApi.DefWindowProc(this.hwnd, this.msg, this.wParam, this.lParam)
+
+[<AutoOpen>]
+module WindowExtensions =
+    type System.IntPtr with
+        member this.hiword = WinDefApi.HIWORD(this)
+        member this.loword = WinDefApi.LOWORD(this)
+        member this.size = Sz(this.hiword.int32, this.loword.int32)
+        member this.location = Pt(this.loword.int32, this.hiword.int32)

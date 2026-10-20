@@ -1,0 +1,49 @@
+﻿namespace Bemo
+open System
+
+type HideTabsOnInactiveGroupPlugin() =
+    let Cell = CellScope()
+    let isDragging = Cell.create(false)
+
+    member this.group = Services.get<WindowGroup>()
+
+    member this.hasGroup = Services.has<WindowGroup>()
+
+    member this.tabStrip = Services.get<TabStrip>()
+
+    member this.shouldShowCompact = 
+        this.group.isForeground.value.not &&
+        this.group.isMouseOver.value.not &&
+        isDragging.value.not &&
+        Services.settings.getValue("hideInactiveTabs").cast<bool>()
+
+    member private this.onShowCompactChanged() =
+        this.tabStrip.dimmed <- this.shouldShowCompact
+
+    interface IDragDropNotification with
+        member this.dragBegin() = this.group.invokeAsync <| fun() ->
+            isDragging.set(true)
+
+        member this.dragEnd() = this.group.invokeAsync <| fun() ->
+            isDragging.set(false)
+
+    interface IPlugin with
+        member this.init() =
+            Services.dragDrop.registerNotification(this :> IDragDropNotification)
+            let group = this.group
+            let mutable disposed = false
+            let subscription = Services.settings.notifyValue "hideInactiveTabs" (fun _ ->
+                group.invokeAsync(fun () -> if not disposed then this.onShowCompactChanged()))
+            group.exited.Add(fun _ ->
+                disposed <- true
+                subscription.Dispose()
+                Services.dragDrop.unregisterNotification(this :> IDragDropNotification))
+            this.group.zorder.changed.Add <| fun() ->
+                this.onShowCompactChanged()
+            this.group.isForeground.changed.Add <| fun() ->
+                this.onShowCompactChanged()
+            this.group.isMouseOver.changed.Add <| fun() ->
+                this.onShowCompactChanged()
+            Cell.listen <| fun() ->
+                isDragging.value.ignore
+                this.onShowCompactChanged()

@@ -1,0 +1,1274 @@
+namespace Bemo
+open System
+open System.Diagnostics
+open System.Drawing
+open System.Drawing.Imaging
+open System.IO
+open System.Reflection
+open System.Threading
+open System.Windows.Forms
+open Bemo.Win32.Forms
+
+module TabNavigation =
+    /// Right neighbour in tab order, or the left one when the closed tab was last.
+    let neighbour (order:IntPtr list) closed =
+        order |> List.tryFindIndex ((=) closed)
+        |> Option.bind(fun index ->
+            let remaining = order |> List.filter ((<>) closed)
+            if remaining.IsEmpty then None
+            else Some remaining.[min index (remaining.Length-1)])
+
+    /// Closing hides a window before destroying it, and Windows activates the window
+    /// below it before discovery removes it. Until then the tab is closing, not gone.
+    let isClosing order isOpen hwnd = List.contains hwnd order && not(isOpen hwnd)
+
+    /// An early foreground event for the window below a closing tab is not a selection.
+    let rememberActive order isOpen previous foreground =
+        if not(List.contains foreground order) then previous
+        else
+            match previous with
+            | Some hwnd when isClosing order isOpen hwnd -> previous
+            | _ -> Some foreground
+
+    /// As in a browser, a tab closed before another tab was selected returns to the
+    /// tab it was opened from; otherwise to its neighbour.
+    let successor (order:IntPtr list) isOpen closed opener =
+        match opener with
+        | Some(tab,owner) when tab=closed && owner<>closed && List.contains owner order && isOpen owner -> Some owner
+        | _ -> neighbour (order |> List.filter(fun item -> item=closed || isOpen item)) closed
+
+    /// Only closing the active tab selects another. A removed HWND that is still open
+    /// is being dragged or ungrouped, and a background group is never activated. Windows
+    /// can activate a window outside the group as the active tab closes; the group is not
+    /// in the background when the foreground left the tab for that close.
+    let closeTarget (order:IntPtr list) isOpen closed foreground active opener leftOnClose =
+        if isOpen closed || active<>Some closed then None
+        elif foreground<>IntPtr.Zero && foreground<>closed && not(List.contains foreground order) && not leftOnClose then None
+        else successor order isOpen closed opener
+
+    /// Windows and some applications activate another window before hiding, destroying or
+    /// minimizing the active one. A tab that goes soon after the foreground moved from it
+    /// to another tab, with no selection since, was not left for that tab.
+    let leftJustBefore (left:(IntPtr * IntPtr * int64) option) gone active now =
+        match left with
+        | Some(tab,next,time) -> tab=gone && active=Some next && now-time <= 500L
+        | None -> false
+
+    /// Closing the active tab activates the previously used window, which can be outside the
+    /// group. A tab that goes soon after the foreground left it for another application closed
+    /// in the foreground, unlike one the user left first.
+    let leftGroupJustBefore (left:(IntPtr * int64) option) gone now =
+        match left with
+        | Some(tab,time) -> tab=gone && now-time <= 500L
+        | None -> false
+
+    /// Selecting another tab forgets the opener, but Windows activating the window
+    /// below a closing tab does not.
+    let keepOpener order isOpen opener foreground =
+        match opener with
+        | Some(tab,_) when foreground<>tab && List.contains foreground order && not(isClosing order isOpen tab) -> None
+        | _ -> opener
+
+    /// Foreground events can arrive out of order. A late event for one tab must not undo
+    /// the activation of another tab of the group that is in the foreground now.
+    let currentForeground (order:IntPtr list) event actual =
+        if actual<>event && List.contains actual order then actual else event
+
+    /// Foreground events are asynchronous. Prefer current OS focus when it is in
+    /// this group; a background group can still navigate from its last top tab.
+    let targetIndex (order:IntPtr list) foreground previousTop next =
+        let current = if List.contains foreground order then Some foreground else previousTop
+        current
+        |> Option.bind(fun hwnd -> order |> List.tryFindIndex ((=) hwnd))
+        |> Option.map(fun index -> (index + (if next then 1 else order.Length-1)) % order.Length)
+
+    /// The tab a number of steps along from the current one, wrapping as switching does.
+    let stepTarget (order:IntPtr list) current previousTop steps next =
+        let current = if List.contains current order then Some current else previousTop
+        current
+        |> Option.bind(fun hwnd -> order |> List.tryFindIndex ((=) hwnd))
+        |> Option.map(fun index ->
+            let count = order.Length
+            order.[((index + (if next then steps else -steps)) % count + count) % count])
+
+    /// A wheel notch is 120. High-resolution wheels and touchpads send one in parts, so only
+    /// whole notches count and the rest waits for the next part; turning back or pausing
+    /// starts afresh. Returns the whole notches, negative towards the user, and the rest.
+    let wheelNotches rest delta fresh =
+        let rest = if fresh || (rest<>0 && sign rest<>sign delta) then 0 else rest
+        let total = rest + delta
+        total / 120, total % 120
+
+    /// Notches still to be stepped through, negative towards the user. Each notch counts;
+    /// turning the other way drops the steps still waiting and goes that way instead.
+    let addSteps pending notches =
+        if pending<>0 && sign pending<>sign notches then notches else pending+notches
+
+    /// Each tab a step passes stays in front this long, a couple of frames, so it is drawn and
+    /// the tabs are seen to move through it instead of jumping.
+    let scrollStepInterval = 40
+
+    /// Where Ctrl + scroll carries the current tab: one place along, never past either end.
+    let moveTarget (order:IntPtr list) foreground previousTop right =
+        let current = if List.contains foreground order then Some foreground else previousTop
+        current
+        |> Option.bind(fun hwnd -> order |> List.tryFindIndex ((=) hwnd) |> Option.map(fun index -> hwnd,index + (if right then 1 else -1)))
+        |> Option.filter(fun (_,index) -> index>=0 && index<order.Length)
+
+module TabOrder =
+    /// Each program's tabs side by side, in title order; tabs that tie keep their places.
+    let byAppThenTitle (app:'a -> string) (title:'a -> string) (tabs:'a list) =
+        let compare = StringComparer.CurrentCultureIgnoreCase
+        tabs |> List.sortWith(fun a b ->
+            match compare.Compare(app a,app b) with
+            | 0 -> compare.Compare(title a,title b)
+            | order -> order)
+
+/// Native window properties survive WindowTabs restarts and expire with their owning HWND.
+module WindowTabLayout =
+    let private key = "WindowTabs.TabLayout.v1"
+    let private marker = 0x57000000
+    let save hwnd (layout:GroupTabLayout) =
+        let dock = match layout.dock with TabDockTop -> 0 | TabDockBottom -> 1 | TabDockLeft -> 2 | TabDockRight -> 3
+        let alignment = function TabLeft -> 0 | TabCenter -> 1 | TabRight -> 2
+        let width = between SettingsCatalog.columnWidthRange layout.columnWidth
+        let value = marker ||| width ||| (dock <<< 9) ||| (alignment layout.normalAlignment <<< 11) ||| (alignment layout.insideAlignment <<< 13)
+        WinUserApi.SetProp(hwnd,key,IntPtr(value)) |> ignore
+
+    let read hwnd =
+        let value = WinUserApi.GetProp(hwnd,key).ToInt64()
+        let width = int(value &&& 511L)
+        let normal,inside = int((value >>> 11) &&& 3L),int((value >>> 13) &&& 3L)
+        if value &&& ~~~32767L <> int64 marker || width<fst SettingsCatalog.columnWidthRange || width>snd SettingsCatalog.columnWidthRange || normal>2 || inside>2 then None
+        else
+            let alignment = function 0 -> TabLeft | 1 -> TabCenter | _ -> TabRight
+            let dock = match int((value >>> 9) &&& 3L) with 0 -> TabDockTop | 1 -> TabDockBottom | 2 -> TabDockLeft | _ -> TabDockRight
+            Some {dock=dock;columnWidth=width;normalAlignment=alignment normal;insideAlignment=alignment inside}
+
+/// Which group a window was in, kept on the window itself, so a restarted WindowTabs puts
+/// windows back together as they were, however they came to be grouped.
+module WindowGroupToken =
+    let private key = "WindowTabs.Group.v1"
+    let private random = Random()
+    let fresh() = lock random (fun () -> random.Next(1,Int32.MaxValue))
+    let save hwnd (token:int) = WinUserApi.SetProp(hwnd,key,IntPtr(token)) |> ignore
+    let read hwnd =
+        match WinUserApi.GetProp(hwnd,key).ToInt64() with
+        | value when value>0L && value<=int64 Int32.MaxValue -> Some(int value)
+        | _ -> None
+
+/// What a group's tab menu chose for that group alone, carried over when the group is rebuilt.
+type GroupMenuChoices = {
+    iconOnly: bool
+    dock: TabDock
+    columnWidth: int
+    alignments: (TabDirection * Bemo.TabAlignment) list
+    autoHideMode: string option }
+
+type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:TabAppearanceInfo) as this =
+    let Cell = CellScope(true)
+    let inputOwnership = Collections.Generic.Dictionary<IntPtr,bool>()
+    let _bb = Blackboard()
+    let invoker = InvokerService.invoker
+    let _os = OS()
+    let mutable hasSavedTabLayout = false
+    let mutable token = WindowGroupToken.fresh()
+    let addedEvent = Event<_>()
+    let movedEvent = Event<IntPtr*int>()
+    let removedEvent = Event<_>()
+    let exitedEvent = Event<_>()
+    let exitPreparations = Collections.Generic.List<(unit -> unit) -> unit>()
+    let mouseLLEvent = Event<Int32 * Pt * IntPtr>()
+    let flashEvent = Event<_>()
+    let keyboardLLEvent = Event<Int32 * KBDLLHOOKSTRUCT * bool>()
+    let foregroundEvent = Event<_>()
+    let geometryChangedEvent = Event<unit>()
+    let tabInfoChangedEvent = Event<IntPtr>()
+    let madeByHandEvent = Event<unit>()
+    let mutable isMadeByHand = false
+    // Supplied by the caller: the main thread waits while this constructor runs.
+    // Calling the settings service here would synchronously invoke that blocked thread.
+    let mutable logicalAppearance = initialAppearance
+    let mutable appearanceSnapshot = logicalAppearance.scaled
+
+    let isDestroyed = Cell.create(false)
+    let zorderCell = Cell.create(List2<IntPtr>())
+    let prevTop = Cell.create(None)
+    /// Bounds to restore windows to, their placement, and the visible frame the tabs sit on.
+    let placement = Cell.create(None:Option<Rect * OSWindowPlacement * Rect>)
+    let placementOwner = obj()
+    let windowsCell = Cell.create(Set2())
+    let _ts = ref None 
+    let inMoveSize = Cell.create(false)
+    let foregroundCell = Cell.create(_os.foreground.hwnd)
+    let prevForegroundCell = ref None
+    let mutable lastActiveTab : IntPtr option = None
+    /// A closing tab and the successor already selected for it before discovery removed it.
+    let mutable followedClose : (IntPtr * IntPtr) option = None
+    /// The active tab that joined the group in the foreground, and the tab active before it.
+    let mutable opener : (IntPtr * IntPtr) option = None
+    /// The last switch between tabs not made by WindowTabs: from, to and when, with the opener before it.
+    let mutable leftTab : (IntPtr * IntPtr * int64) option = None
+    let mutable leftOpener : (IntPtr * IntPtr) option = None
+    /// The last tab the foreground left for a window outside the group, and when.
+    let mutable leftGroup : (IntPtr * int64) option = None
+    let isMinimized hwnd = this.os.windowFromHwnd(hwnd).isMinimized
+    let isOpen hwnd = WinUserApi.IsWindow(hwnd) && WinUserApi.IsWindowVisible(hwnd)
+    let hookCleanup = Cell.create(Map2<IntPtr, IDisposable>())
+    let shellHookWindow = Cell.create(None)
+    let winEventHandler = Cell.create(None)
+    let mutable themeSubscription : IDisposable option = None
+    let mutable placementCompletion : IDisposable option = None
+    /// Each tab's colour as chosen, turned into a colour for the current theme when drawn.
+    let mutable tabColors : Map<IntPtr,TabColorChoice> = Map.empty
+    let isDraggingCell = Cell.create(false)
+    let isDraggingExport = Cell.export <| fun() -> isDraggingCell.value
+    let zorderExport = Cell.export <| fun() -> zorderCell.value
+    let isVisibleCell = Cell.create(false)
+    let locationGate = obj()
+    let pendingLocations = Collections.Generic.HashSet<IntPtr>()
+    let pendingMinimizeStates = Collections.Generic.Dictionary<IntPtr,bool * int64>()
+    let requestedMinimizeStates = Collections.Generic.Dictionary<IntPtr,bool>()
+    let minimizeStateTimer = new System.Windows.Forms.Timer(Interval=16)
+    let mutable reconcileMinimizeState = false
+    let mutable reconcilePlacementState = false
+    /// The tab the group was last minimized from, which comes back first.
+    let mutable minimizedFrom : IntPtr option = None
+    /// IDE Mode's workspace, and the fit it last asked for with how many times the window kept
+    /// another frame since, so an editor that will not take that size is not asked forever.
+    let mutable isWorkspaceGroup = false
+    let mutable workspaceFit : (IntPtr * Rect * int) option = None
+    /// The workspace's column is hidden by its shortcut, and its editor takes the whole screen.
+    let sidebarHiddenCell = Cell.create(false)
+    let transitionClock = Stopwatch.StartNew()
+    let iconCache = new WindowIconCache(invoker :> IDispatcher,fun hwnd ->
+        Cell.beginUpdate()
+        try
+            if not isDestroyed.value && this.windows.contains(hwnd) then this.setTabInfo(hwnd)
+        finally Cell.endUpdate())
+
+    let isMaximizedExport = Cell.export <| fun() ->
+        zorderCell.value.tryHead.exists(fun hwnd -> this.os.windowFromHwnd(hwnd).isMaximized)
+ 
+    let boundsExport = Cell.export <| fun() ->
+        placement.value.bind <| fun(_,_,visible) ->
+            if isVisibleCell.value then Some(visible) else None
+
+    let isForegroundExport = Cell.export <| fun() ->
+        zorderCell.value.any((=) foregroundCell.value)
+
+    member this.isSuperBarEnabled = enableSuperBar
+    /// A tab was dragged into it, or it was made by dragging a tab out: only such groups are
+    /// remembered after their windows close, as rules and auto grouping remake the others.
+    member this.isManual
+        with get() = isMadeByHand
+        and set value =
+            let changed = value && not isMadeByHand
+            isMadeByHand <- value
+            if changed then madeByHandEvent.Trigger()
+    /// The group became one made by hand, after the tabs that made it so had joined.
+    member this.madeByHand = madeByHandEvent.Publish
+    /// Saved on each window it holds; a group restored after a restart takes its windows' token.
+    member this.groupToken
+        with get() = System.Threading.Volatile.Read(&token)
+        and set value = System.Threading.Volatile.Write(&token,value)
+
+    member private this.finishPlacementReconciliation() =
+        if not isDestroyed.value then
+            // WinEvents report the start of restoration, before ShowWindow and its
+            // owned-popup visibility changes finish on the placement worker.
+            if reconcileMinimizeState && FollowerPlacement.queue.isIdle(placementOwner) then
+                reconcileMinimizeState <- false
+                this.withUpdate(fun () ->
+                    // Minimizing sends the tab in front to the bottom; once the whole group is
+                    // minimized, it goes back in front, so restoring the group brings it back first.
+                    let order =
+                        match minimizedFrom with
+                        | Some hwnd when this.windows.contains(hwnd) && zorderCell.value.all isMinimized ->
+                            // Windows gives the focus to the next window, often another tab, and a
+                            // click on the taskbar button would then restore that tab instead.
+                            let focused = WinUserApi.GetForegroundWindow()
+                            if focused<>hwnd && this.windows.contains(focused) then
+                                this.os.windowFromHwnd(hwnd).setForeground(true)
+                            zorderCell.value.where((<>) hwnd).prepend hwnd
+                        | _ -> zorderCell.value
+                    minimizedFrom <- None
+                    let order = order.where(fun hwnd -> this.windows.contains(hwnd) && WinUserApi.IsWindow(hwnd))
+                    this.os.setZorder(order)
+                    this.setZorder(order)
+                    this.saveZorder()
+                    if not this.isEmpty then this.saveTopWindowPlacement()
+                    this.updateIsVisible()
+                    this.foreground <- this.os.foreground.hwnd)
+                if not this.isEmpty then this.setTsParent(this.topWindow)
+            if reconcilePlacementState && FollowerPlacement.queue.isIdle(placementOwner) then
+                reconcilePlacementState <- false
+                this.withUpdate(fun () -> this.updateIsVisible())
+                if not this.isEmpty then this.setTsParent(this.topWindow)
+            if pendingMinimizeStates.Count=0 then minimizeStateTimer.Stop()
+
+    member this.init(ts:TabStrip) =
+        _ts := Some(ts)
+        placementCompletion <- Some(FollowerPlacement.queue.Idle.Subscribe(fun owner ->
+            if obj.ReferenceEquals(owner,placementOwner) then
+                invoker.asyncInvoke(fun () ->
+                    this.finishPlacementReconciliation()
+                    this.fitWorkspace())))
+        minimizeStateTimer.Tick.Add(fun _ ->
+            let now = transitionClock.ElapsedMilliseconds
+            for hwnd,(minimized,deadline) in pendingMinimizeStates |> Seq.map(fun pair -> pair.Key,pair.Value) |> Seq.toList do
+                if this.windows.contains(hwnd).not || not(WinUserApi.IsWindow(hwnd)) || now>=deadline then pendingMinimizeStates.Remove(hwnd) |> ignore
+                elif this.os.windowFromHwnd(hwnd).isMinimized=minimized then
+                    pendingMinimizeStates.Remove(hwnd) |> ignore
+                    this.main(hwnd,if minimized then WinEvent.EVENT_SYSTEM_MINIMIZESTART else WinEvent.EVENT_SYSTEM_MINIMIZEEND)
+            this.finishPlacementReconciliation())
+
+        winEventHandler.set(Some(
+            _os.setSingleWinEvent WinEvent.EVENT_SYSTEM_FOREGROUND <| fun(hwnd) -> 
+                this.main(hwnd, WinEvent.EVENT_SYSTEM_FOREGROUND)))
+            
+        shellHookWindow.set(Some(_os.registerShellHooks this.shellEvents))
+        
+            
+        isMaximizedExport.init()
+        isDraggingExport.init()
+        zorderExport.init()
+        boundsExport.init()
+        isForegroundExport.init()
+
+        this.ts.setTabAppearance(this.tabAppearance)
+        let appColorsSubscription = Services.settings.notifyValue "appTabColors" (fun _ ->
+            this.invokeAsync(fun() -> if not isDestroyed.value then this.refreshTabColors()))
+        exitedEvent.Publish.Add(fun _ -> appColorsSubscription.Dispose())
+        let colorModeSubscription = Services.settings.notifyValue "tabColorMode" (fun _ ->
+            this.invokeAsync(fun() -> if not isDestroyed.value then this.refreshTabColors()))
+        exitedEvent.Publish.Add(fun _ -> colorModeSubscription.Dispose())
+        let colorStyleSubscription = Services.settings.notifyValue "tabColorStyle" (fun value ->
+            this.invokeAsync(fun() -> if not isDestroyed.value then this.ts.colorStyle <- unbox value))
+        exitedEvent.Publish.Add(fun _ -> colorStyleSubscription.Dispose())
+        let ideModeSubscription = Services.settings.notifyValue "ideMode" (fun value ->
+            this.invokeAsync(fun() ->
+                if not isDestroyed.value then
+                    this.refreshTabNames()
+                    if unbox<bool> value then this.refitWorkspace() elif isWorkspaceGroup then this.leaveWorkspace()))
+        exitedEvent.Publish.Add(fun _ -> ideModeSubscription.Dispose())
+        // A wider or narrower column, another monitor layout or a moved taskbar changes the space left.
+        this.ts.dockChanged.Add(fun () -> this.refitWorkspace())
+        let displayChanged = EventHandler(fun _ _ -> this.invokeAsync(fun () -> if not isDestroyed.value then this.refitWorkspace()))
+        let preferenceChanged = Microsoft.Win32.UserPreferenceChangedEventHandler(fun _ _ ->
+            this.invokeAsync(fun () -> if not isDestroyed.value then this.refitWorkspace()))
+        Microsoft.Win32.SystemEvents.add_DisplaySettingsChanged displayChanged
+        Microsoft.Win32.SystemEvents.add_UserPreferenceChanged preferenceChanged
+        exitedEvent.Publish.Add(fun _ ->
+            Microsoft.Win32.SystemEvents.remove_DisplaySettingsChanged displayChanged
+            Microsoft.Win32.SystemEvents.remove_UserPreferenceChanged preferenceChanged)
+        themeSubscription <- Some(ThemeService.changed.Subscribe(fun () ->
+            this.invokeAsync <| fun() ->
+                if not isDestroyed.value then
+                    logicalAppearance <- ThemeService.currentAppearance()
+                    this.applyTabColors()
+                    let next = logicalAppearance.scaled
+                    let geometryChanged = TabGeometry.fromAppearance next <> TabGeometry.fromAppearance appearanceSnapshot
+                    if next <> appearanceSnapshot then
+                        appearanceSnapshot <- next
+                        this.ts.setTabAppearance(next)
+                        if geometryChanged then geometryChangedEvent.Trigger()))
+
+        Cell.listen <| fun() ->
+            this.ts.zorder <- zorderCell.value.map(Tab)
+            
+        Cell.listen <| fun() ->
+            this.ts.foreground <- this.foregroundTab
+        
+        Cell.listen <| fun() ->
+            //this is important, we dont' want to leave the parent set to the previous hwnd
+            //which was removed, this can cause issues when that window gets added to another
+            //group on another thread during drag / drop
+            this.setTsParent(if this.isEmpty.not then zorderCell.value.head else IntPtr.Zero)
+
+        Cell.listen <| fun() ->
+            this.ts.visible <- isVisibleCell.value && not sidebarHiddenCell.value
+
+        this.ts.layoutChanged.Add(fun chosen ->
+            if chosen then hasSavedTabLayout <- true
+            if hasSavedTabLayout then this.windows.items.iter(fun hwnd -> WindowTabLayout.save hwnd this.tabLayout))
+        Services.registerLocal(this)
+
+        plugins.iter <| fun p -> p.init()
+
+    member this.foreground
+        with get() = foregroundCell.value
+        and set(value) =
+            let value = TabNavigation.currentForeground this.lorder.list value this.os.foreground.hwnd
+            let active = TabNavigation.rememberActive this.lorder.list isOpen lastActiveTab value
+            // Minimizing the active tab activates another tab that the group minimizes next.
+            let active =
+                match lastActiveTab,active with
+                | Some left,Some next when left<>next && isMinimized left && this.isMinimizing next -> lastActiveTab
+                | _ -> active
+            match lastActiveTab,active with
+            | Some left,Some next when left<>next ->
+                leftTab <- Some(left,next,transitionClock.ElapsedMilliseconds)
+                leftOpener <- opener
+            | _ -> ()
+            lastActiveTab <- active
+            let prev = foregroundCell.value
+            if prev <> value then
+                if List.contains prev this.lorder.list && not(List.contains value this.lorder.list) then
+                    leftGroup <- Some(prev,transitionClock.ElapsedMilliseconds)
+                opener <- TabNavigation.keepOpener this.lorder.list isOpen opener value
+                foregroundCell.set(value)
+                foregroundEvent.Trigger()
+
+    member this.foregroundTab =
+        if this.windows.contains(this.foreground) then
+            Some(Tab(this.foreground))
+        else
+            None
+
+    member this.postMouseLL(msg, pt, data) = mouseLLEvent.Trigger(msg, pt, data)
+    member this.postKeyboardLL(key, data, controlPressed) = keyboardLLEvent.Trigger(key, data, controlPressed)
+    member this.mouseLL = mouseLLEvent.Publish
+    member this.keyboardLL = keyboardLLEvent.Publish
+    member this.bb = _bb
+    member this.ts : TabStrip = _ts.Value.Value
+    
+    member this.isPointInTs (pt:Pt) =
+        let hwnd = Win32Helper.GetTopLevelWindowFromPoint(pt.Point)
+        this.ts.hwnd = hwnd
+
+    member this.isPointInGroup (pt:Pt) =
+        let hwnd = Win32Helper.GetTopLevelWindowFromPoint(pt.Point)
+        this.ts.hwnd = hwnd || this.windows.contains(hwnd)
+    
+    member this.topWindow = zorderCell.value.head
+   
+
+    member this.windows : Set2<IntPtr> = windowsCell.value
+
+    
+    // .scaled converts the stored logical pixels to physical ones. The stored
+    // record stays logical because Settings writes it back to the settings file.
+    member this.tabAppearance = appearanceSnapshot
+    member this.geometryChanged = geometryChangedEvent.Publish
+
+    member private this.withUpdate<'a> (f:unit -> 'a) : 'a =
+        Cell.beginUpdate()
+        try f()
+        finally Cell.endUpdate()
+
+    member this.invokeSync f =
+        invoker.invoke (fun() -> this.withUpdate f)
+
+    member this.invokeAsync f =
+        invoker.asyncInvoke <| fun() -> this.withUpdate f
+
+    member private this.updateIsVisible() =
+        isVisibleCell.value <-
+            this.isEmpty.not &&
+            zorderCell.value.where(isMinimized >> not).tryHead.exists(fun hwnd -> not(WindowCloaking.IsCloaked hwnd)) &&
+            inMoveSize.value.not
+            
+    member private this.updatePlacements() =
+        zorderCell.value.tail.iter(this.adjustWindowPlacement)
+
+    member private this.adjustChildWindows = fun() ->
+        this.updatePlacements()
+        
+    member private this.makeTopWindowForeground() =
+        match zorderCell.value.where(isMinimized >> not).tryHead with
+        | Some(top) -> 
+            let window = this.os.windowFromHwnd(top)
+            window.setForeground(false)
+        | None -> ()
+
+    member private this.hideChildWindows() =
+        zorderCell.value.tail.iter(fun hwnd -> FollowerPlacement.queue.submit(placementOwner,hwnd,FollowerPlacement.hideRequest hwnd))
+
+    member private this.inZorder(windows:List2<IntPtr>) =
+        // One desktop snapshot keeps the order consistent and avoids enumerating
+        // every desktop window again for each tab during activation.
+        let order = this.os.windowZorders
+        windows.sortBy(fun hwnd -> order.tryFind(hwnd).def(9999))
+
+    member private this.setZorder(newZorder:List2<_>) =
+        if zorderCell.value.list <> newZorder.list then
+            if newZorder.tryHead<>zorderCell.value.tryHead then
+                newZorder.tryHead.iter(fun hwnd ->
+                    FollowerPlacement.queue.cancel(placementOwner,hwnd,whenValue=(fun (_,request) ->
+                        match request with SetMinimized _ -> false | _ -> true)))
+            prevTop.set(zorderCell.value.tryHead)
+            zorderCell.set(newZorder)
+
+    /// While the group minimizes or restores, Windows reorders its windows one by one; restored
+    /// without activation, a tab owned by the taskbar window even rises above the one in front.
+    /// The order is put back and saved once the transition ends.
+    member private this.saveZorder() =
+        // Restoring owned followers during a move can raise them above its source;
+        // keep that source on top so its move-end event still restores the strip.
+        if not reconcileMinimizeState && not inMoveSize.value then
+            let focused = this.os.foreground.hwnd
+            let selected = this.windows.contains(focused) && not(isMinimized focused) && zorderCell.value.tryHead<>Some focused
+            // Placement can raise a follower before its stacking correction. Only an
+            // actual foreground change may select another tab while that work is pending.
+            if not reconcilePlacementState || selected then
+                let order = this.inZorder(this.windows.items)
+                this.setZorder(if reconcilePlacementState then order.where((<>) focused).prepend focused else order)
+
+    member private this.setWindows(newWindows) =
+        windowsCell.set(newWindows)
+        // Tabs that join or leave during a transition change the order at once; the others keep theirs.
+        if reconcileMinimizeState || reconcilePlacementState || inMoveSize.value then
+            let kept = zorderCell.value.where(this.windows.contains)
+            let joined = this.inZorder(this.windows.items.where(fun hwnd -> not (kept.contains((=) hwnd))))
+            this.setZorder(List2(kept.list @ joined.list))
+            this.saveZorder()
+        else this.saveZorder()
+        this.updateIsVisible()
+
+    member private this.isEmpty : bool = this.windows.items.isEmpty
+
+    member private this.bringToTop hwnd =
+        this.setZorder(zorderCell.value.moveToEnd((=)hwnd))
+
+    member this.isRenamed hwnd = Services.program.getWindowNameOverride(hwnd).IsSome
+
+    member private this.getLastName (text: string) = 
+        let separators = [| '\\'; '/' |]
+        let parts = text.Split(separators, System.StringSplitOptions.RemoveEmptyEntries)
+        if parts.Length > 0 then parts.[parts.Length - 1] else text
+    
+    /// The name the window itself gives the tab: the last part of its title, or in IDE Mode an
+    /// editor's project.
+    member this.windowName hwnd =
+        let window = this.os.windowFromHwnd(hwnd)
+        if IdeMode.isOn() && IdeMode.isSupported window.pid.processPath then
+            let others = this.windows.items.list |> List.filter((<>)hwnd) |> List.map(fun other -> this.os.windowFromHwnd(other).text)
+            IdeMode.label window.text others
+        else this.getLastName(window.text)
+
+    /// The tab's name as the user reads and edits it: their own, else the window's.
+    member this.tabName hwnd = Services.program.getWindowNameOverride(hwnd).def(this.windowName hwnd)
+
+    member private this.getTabInfo(hwnd) =
+        let window = this.os.windowFromHwnd(hwnd)
+        let small,big = StartupTrace.measure "group.icons" (fun () -> iconCache.get(hwnd))
+        {
+            text = this.tabName hwnd
+            isRenamed = this.isRenamed hwnd
+            iconSmall = small
+            iconBig = big
+            preview = fun() ->
+                try
+                    if window.isMinimized then
+                        // A minimized window cannot be printed. It stands in as its app's icon, a
+                        // third of the window's shorter side: the taskbar shrinks the whole window
+                        // to a thumbnail, and a 32-pixel icon became a dot.
+                        let size = this.previewArea.size
+                        let side = max 32 (min 256 (min size.width size.height / 3))
+                        let shellIcon =
+                            try
+                                if window.className="ApplicationFrameWindow" then AppIcons.GetAppIcon(AppIcons.GetHostedAppId(hwnd),side)
+                                else
+                                    let path = window.pid.processPath
+                                    if AppIcons.HasOwnIcon(path) then AppIcons.GetFileIcon(path,side) else null
+                            with _ -> null
+                        use large = if isNull shellIcon then (let _,icon = iconCache.get(hwnd) in icon.ToBitmap()) else shellIcon
+                        let img = Img(size)
+                        try
+                            use g = img.graphics
+                            use background = new SolidBrush(if ThemeService.currentIsDark() then Color.FromArgb(56,56,56) else Color.FromArgb(232,232,232))
+                            g.FillRectangle(background, Rect(Pt(), size).Rectangle)
+                            g.InterpolationMode <- Drawing2D.InterpolationMode.HighQualityBicubic
+                            g.DrawImage(large, Rectangle((size.width-side)/2, (size.height-side)/2, side, side))
+                            img
+                        with _ ->
+                            img.bitmap.Dispose()
+                            reraise()
+                    else
+                        StartupTrace.measure "preview.print" (fun () -> Img(Win32Helper.PrintWindow(hwnd)))
+                with ex -> Img(Sz(1, 1))
+        }
+    
+    member private this.tintTab dark hwnd =
+        this.ts.setTabTint(Tab(hwnd), tabColors.TryFind hwnd |> Option.map(Theme.tabColor dark))
+
+    member private this.tintsDark = Theme.darkBar logicalAppearance.tabNormalBgColor
+
+    member private this.applyTabColors() =
+        this.windows.items.iter(this.tintTab this.tintsDark)
+
+    /// Asks the main thread, so only for a new tab or a changed colour; titles change far more often.
+    member private this.fetchTabColor hwnd =
+        let order = this.lorder.list
+        let peers = if List.contains hwnd order then order else order @ [hwnd]
+        tabColors <-
+            match Services.program.getTabColor(hwnd,peers) with
+            | Some color -> tabColors.Add(hwnd,color)
+            | None -> tabColors.Remove hwnd
+
+    member private this.refreshTabColor hwnd =
+        this.fetchTabColor hwnd
+        this.tintTab this.tintsDark hwnd
+
+    /// One call to the main thread for the whole group: a call per tab made adding each
+    /// window to a large group at startup cost a round trip for every tab already in it.
+    member private this.refreshTabColors() =
+        let order = this.lorder.list
+        let hwnds = this.windows.items.list
+        let peers = order @ (hwnds |> List.filter(fun hwnd -> not(List.contains hwnd order)))
+        let colors = Services.program.getTabColors(hwnds,peers)
+        tabColors <- List.zip hwnds colors |> List.fold (fun known (hwnd,color) ->
+            match color with
+            | Some color -> known.Add(hwnd,color)
+            | None -> known.Remove hwnd) tabColors
+        this.applyTabColors()
+
+    member this.tabColor hwnd = tabColors.TryFind hwnd
+
+    member private this.setTabInfo(hwnd) =
+        let isNew = not(this.ts.hasTabInfo(Tab(hwnd)))
+        if isNew then this.refreshTabColor(hwnd)
+        let info = this.getTabInfo(hwnd)
+        let previous = this.ts.tabInfo(Tab(hwnd))
+        if isNew || info.text <> previous.text || info.isRenamed <> previous.isRenamed ||
+           not(obj.ReferenceEquals(info.iconSmall,previous.iconSmall)) ||
+           not(obj.ReferenceEquals(info.iconBig,previous.iconBig)) then
+            this.ts.setTabInfo(Tab(hwnd),info)
+            // A new tab's first details come as it joins, and its added event follows: telling
+            // listeners twice updated the taskbar twice for every window at startup.
+            if not isNew then tabInfoChangedEvent.Trigger(hwnd)
+
+    /// An IDE Mode label depends on the other tabs' titles, which tell projects apart.
+    member private this.refreshTabNames() =
+        this.windows.items.iter(fun hwnd -> if this.ts.hasTabInfo(Tab(hwnd)) then this.setTabInfo hwnd)
+
+    member private this.setTsOwner(owner:Window) =
+        let strip = this.os.windowFromHwnd(this.ts.hwnd)
+        StartupTrace.measure "group.owner" (fun () ->
+            strip.setOwner(if this.canShareInput owner.hwnd then owner else this.os.nullWindow))
+
+    /// Permission checks stay off the placement hot path and expire with group membership.
+    member this.canShareInput hwnd =
+        if hwnd=IntPtr.Zero then false
+        else
+            match inputOwnership.TryGetValue hwnd with
+            | true,compatible -> compatible
+            | _ ->
+                let compatible = WindowInputOwnership.CanShareWithCurrentProcess hwnd
+                inputOwnership.[hwnd] <- compatible
+                compatible
+
+    member private this.setTsParent(parentHwnd) =
+        let strip = this.os.windowFromHwnd(this.ts.hwnd)
+        let parent = this.os.windowFromHwnd(parentHwnd)
+        this.setTsOwner(parent)
+        // Restore can leave an owned popup visible but behind its unchanged owner.
+        // Keep it adjacent to that window without activating or raising the group.
+        if parentHwnd<>IntPtr.Zero && not parent.isMinimized then
+            let previous = parent.prevZorder
+            if previous.hwnd<>strip.hwnd then strip.insertAfter(previous)
+        this.ts.refreshShadow()
+        
+    member this.isIconOnly 
+        with get() = this.ts.isIconOnly
+        and set(value) = this.ts.isIconOnly <- value
+
+    member this.tabLayout : GroupTabLayout = {
+        dock=this.ts.dock; columnWidth=this.ts.columnWidth
+        normalAlignment=this.ts.getAlignment TabUp; insideAlignment=this.ts.getAlignment TabDown }
+
+    member this.applyTabLayout(layout:GroupTabLayout) =
+        this.ts.dock <- layout.dock
+        this.ts.columnWidth <- layout.columnWidth
+        this.ts.setAlignment(TabUp,layout.normalAlignment)
+        this.ts.setAlignment(TabDown,layout.insideAlignment)
+
+    member this.menuChoices = {
+        iconOnly = this.isIconOnly
+        dock = this.ts.dock
+        columnWidth = this.ts.columnWidth
+        alignments = this.ts.alignmentChoices
+        autoHideMode = Option.ofObj(this.bb.read<string>("autoHideMode", null)) }
+
+    member this.applyMenuChoices(choices:GroupMenuChoices) =
+        this.ts.dock <- choices.dock
+        this.ts.columnWidth <- choices.columnWidth
+        this.isIconOnly <- choices.iconOnly
+        choices.alignments |> List.iter this.ts.setAlignment
+        choices.autoHideMode |> Option.iter(fun mode -> this.bb.write("autoHideMode", mode))
+
+    member this.hwnd = this.ts.hwnd
+
+    member private this.os : OS = _os
+       
+    member private this.windowCount = this.windows.count
+
+    member this.placementBounds : Rect = placement.value.map(fun(bounds,_,_) -> bounds).def(Rect())
+
+    /// Where the group's windows are, for previews: nothing is saved for a group that has not
+    /// been on screen since WindowTabs started, minimized from the start, say.
+    member this.previewArea : Rect =
+        let saved = this.placementBounds
+        match zorderCell.value.tryHead with
+        | Some top when saved.size.isEmptyArea ->
+            let window = this.os.windowFromHwnd(top)
+            if window.isMinimized then window.placement.rcNormalPosition else window.bounds
+        | _ -> saved
+
+    member private this.isTop(hwnd) = zorderCell.value.where(isMinimized >> not).tryHead = Some(hwnd)
+
+    member private this.saveTopWindowPlacement() =
+        let window = this.os.windowFromHwnd(zorderCell.value.head)
+        let dpi = Dpi.forMonitor window.hwnd
+        if dpi <> Dpi.value() then
+            Dpi.set dpi
+            appearanceSnapshot <- logicalAppearance.scaled
+            this.ts.setTabAppearance(appearanceSnapshot)
+            geometryChangedEvent.Trigger()
+        if  window.isMinimized.not &&
+            this.os.isOnScreen(window.bounds)
+            then
+            let monitorBounds =
+                if window.isMaximized then
+                    //windows are placed slightly off screen when maximized, get the bounds of the monitor instead
+                    Mon.fromHwnd(window.hwnd).map(fun mon -> mon.workRect.move(-1,-1))
+                else None
+            let bounds = monitorBounds.def(window.bounds)
+            let visible = monitorBounds.def(window.visibleBounds)
+            placement.set(Some(bounds, window.placement, visible))
+            if enableSuperBar then this.prepareMinimizeAnchor window.hwnd
+
+    member this.prepareMinimizeAnchor hwnd =
+        if FollowerPlacement.queue.isWindowIdle(placementOwner,hwnd) && this.os.windowFromHwnd(hwnd).needsMinimizeAnchor then
+            FollowerPlacement.queue.submit(placementOwner,hwnd,FollowerPlacement.prepareMinimizeRequest hwnd)
+            reconcilePlacementState <- true
+            this.finishPlacementReconciliation()
+           
+    member private this.adjustWindowPlacement(hwnd) =
+        let changingMinimizeState =
+            match requestedMinimizeStates.TryGetValue(hwnd) with
+            | true,expected -> this.os.windowFromHwnd(hwnd).isMinimized<>expected && FollowerPlacement.isChangingMinimizeState placementOwner hwnd
+            | _ -> false
+        if placement.value.IsSome && not changingMinimizeState then
+            let bounds,wp,visible = placement.value.Value
+            let below = zorderCell.value.tryHead |> Option.filter((<>) hwnd)
+            let request = FollowerPlacement.alignFrameRequest hwnd bounds visible wp below
+            FollowerPlacement.queue.submit(placementOwner,hwnd,request)
+            // Maximize/snap can hide or cover the owned strip after its early events.
+            reconcilePlacementState <- true
+            this.finishPlacementReconciliation()
+
+    member this.isPlacementIdle = FollowerPlacement.queue.isIdle(placementOwner) && not reconcileMinimizeState && not reconcilePlacementState
+
+    /// IDE Mode's workspace group: its editors fill their monitor's work area beside the column.
+    member this.isWorkspace
+        with get() = isWorkspaceGroup
+        and set value =
+            if value<>isWorkspaceGroup then
+                if value then
+                    isWorkspaceGroup <- true
+                    this.refitWorkspace()
+                else
+                    this.leaveWorkspace()
+                    isWorkspaceGroup <- false
+
+    /// In IDE Mode a group holds one editor's windows only, so another editor's tab stays out.
+    member this.acceptsTab hwnd =
+        let path (window:IntPtr) = this.os.windowFromHwnd(window).pid.processPath
+        not (IdeMode.isOn()) || IdeMode.mayJoin (path hwnd) (this.windows.items.list |> List.filter((<>)hwnd) |> List.map path)
+
+    member this.fillsWorkspace = isWorkspaceGroup && not isDestroyed.value && _ts.Value.IsSome && IdeMode.isOn() && this.ts.isVertical
+
+    /// Sizes the front editor to its monitor beside the column, restoring it if maximized; the
+    /// others follow it as any group's windows do. Left alone while it is minimized, moved or
+    /// sized by hand, or a tab is dragged.
+    member this.fitWorkspace() =
+        if this.fillsWorkspace then
+            this.windows.items.iter(fun hwnd -> IdeMode.Restore.remember hwnd (this.os.windowFromHwnd(hwnd).placement))
+            match zorderCell.value.tryHead with
+            | Some top when not inMoveSize.value && not isDraggingCell.value && FollowerPlacement.queue.isWindowIdle(placementOwner,top) ->
+                let window = this.os.windowFromHwnd(top)
+                match Mon.fromHwnd top with
+                | Some monitor when not window.isMinimized ->
+                    // The column overlaps the editor's frame by its seam (see sidePlacement), so it
+                    // starts at the screen's edge instead of a pixel or two in.
+                    let column = if sidebarHiddenCell.value then 0 else this.ts.columnPixels - min this.ts.columnPixels (Dpi.scale 1)
+                    let frame = IdeMode.workspaceFrame monitor.workRect this.ts.dock column
+                    let seen = window.visibleBounds
+                    let near (a:int) b = abs(a-b)<=1
+                    let fits = not window.isMaximized && near seen.left frame.left && near seen.top frame.top &&
+                               near seen.right frame.right && near seen.bottom frame.bottom
+                    let attempts = match workspaceFit with Some(hwnd,asked,count) when hwnd=top && asked=frame -> count | _ -> 0
+                    if fits then workspaceFit <- None
+                    elif attempts<3 then
+                        workspaceFit <- Some(top,frame,attempts+1)
+                        let own = window.bounds
+                        // The invisible resize borders stay outside the frame; a maximized window's say nothing.
+                        let bounds =
+                            if window.isMaximized || seen.size.isEmptyArea then frame
+                            else Rect(Pt(frame.x-(seen.x-own.x),frame.y-(seen.y-own.y)),Sz(frame.width+own.width-seen.width,frame.height+own.height-seen.height))
+                        let wp = {window.placement with showCmd=ShowWindowCommands.SW_SHOWNORMAL; rcNormalPosition=bounds}
+                        FollowerPlacement.queue.submit(placementOwner,top,FollowerPlacement.alignFrameRequest top bounds frame wp None)
+                        reconcilePlacementState <- true
+                        this.finishPlacementReconciliation()
+                | _ -> ()
+            | _ -> ()
+
+    member this.isSidebarHidden = sidebarHiddenCell.value
+
+    /// Hides the workspace's column, its editor taking the space, or shows it again as it was:
+    /// expanded or icons only. The editor in front and the focus stay where they are.
+    member this.toggleSidebar() =
+        if this.fillsWorkspace then
+            sidebarHiddenCell.set(not sidebarHiddenCell.value)
+            geometryChangedEvent.Trigger()
+            this.refitWorkspace()
+
+    /// Fits again after a change that may leave the same frame wanted, such as a drag by hand.
+    member private this.refitWorkspace() =
+        workspaceFit <- None
+        if _ts.Value.IsSome then this.ts.isWorkspaceColumn <- this.fillsWorkspace
+        this.fitWorkspace()
+
+    /// The front editor gets back its placement from before the workspace, and the others follow it.
+    member private this.leaveWorkspace() =
+        workspaceFit <- None
+        sidebarHiddenCell.set(false)
+        if _ts.Value.IsSome then this.ts.isWorkspaceColumn <- false
+        let saved = this.windows.items.list |> List.choose(fun hwnd -> IdeMode.Restore.take hwnd |> Option.map(fun placement -> hwnd,placement))
+        match zorderCell.value.tryHead |> Option.bind(fun top -> saved |> List.tryFind(fst >> (=) top)) with
+        | Some(top,placement) ->
+            let placement = {placement with showCmd=IdeMode.Restore.showCmd placement}
+            FollowerPlacement.queue.submit(placementOwner,top,FollowerPlacement.request top placement.rcNormalPosition placement)
+            reconcilePlacementState <- true
+            this.finishPlacementReconciliation()
+        | None -> ()
+                     
+    member this.setTabColor(hwnd,color) =
+        Services.program.setTabColorOverride(hwnd,color)
+        this.refreshTabColor(hwnd)
+
+    member this.setTabName(hwnd,name) =
+        Services.program.setWindowNameOverride(hwnd, name)
+        this.setTabInfo(hwnd)
+
+    member this.isMaximized = isMaximizedExport :> ICellOutput<bool>
+
+    member this.isMouseOver = this.ts.isMouseOver
+
+    member this.isDragging = isDraggingExport :> ICellOutput<bool>
+
+    /// A tab is being dragged anywhere: the workspace stays put until the drop has placed its windows.
+    member this.isTabDragging
+        with get() = isDraggingCell.value
+        and set value =
+            isDraggingCell.set(value)
+            if not value then this.refitWorkspace()
+
+    member this.flashTab(tab, flash) =
+        flashEvent.Trigger(tab, flash)
+        this.ts.setTabBgColor(tab, if flash then Some(this.tabAppearance.tabFlashBgColor) else None)
+        
+    member this.shellEvents(hwnd, evt) = this.invokeAsync <| fun() ->
+        Cell.beginUpdate()
+        match evt with
+        | ShellEvent.HSHELL_FLASH ->
+            //don't flash if its only a single window in the group
+            if this.windows.contains(hwnd) &&
+               this.windows.count > 1 then
+                this.flashTab(Tab(hwnd), true)
+        | ShellEvent.HSHELL_REDRAW ->
+            if this.windows.contains(hwnd) then
+                this.flashTab(Tab(hwnd), false)
+                iconCache.get(hwnd,force=true) |> ignore
+                this.setTabInfo(hwnd)
+                if IdeMode.isOn() then this.refreshTabNames()
+        | ShellEvent.HSHELL_WINDOWACTIVATED 
+        | ShellEvent.HSHELL_RUDEAPPACTIVATED ->
+            if this.windows.contains(hwnd) then
+                this.saveZorder()
+                this.setTabInfo(hwnd)
+        | _ -> ()
+        Cell.endUpdate()
+        
+
+    member this.onEnterMoveSize() =
+        inMoveSize.set(true)
+        this.hideChildWindows()
+        this.updateIsVisible()
+
+    member this.onExitMoveSize() =
+        inMoveSize.set(false)
+        this.saveTopWindowPlacement()
+        this.adjustChildWindows()
+        this.makeTopWindowForeground()
+        this.updateIsVisible()
+        // A workspace editor dragged by its title bar or border goes back beside the column.
+        this.refitWorkspace()
+
+    member this.main(hwnd, evt) =
+        let location = evt = WinEvent.EVENT_OBJECT_LOCATIONCHANGE
+        let post = not location || lock locationGate (fun () -> pendingLocations.Add(hwnd))
+        if post then
+            this.invokeAsync(fun () ->
+                if location then lock locationGate (fun () -> pendingLocations.Remove(hwnd) |> ignore)
+                if not isDestroyed.value then this.handleWindowEvent(hwnd,evt))
+
+    member private this.handleWindowEvent(hwnd,evt) =
+        // These native events announce the start of a transition. A group STA
+        // can receive them before the source's IsIconic state has changed.
+        let minimizeEvent = evt=WinEvent.EVENT_SYSTEM_MINIMIZESTART || evt=WinEvent.EVENT_SYSTEM_MINIMIZEEND
+        if minimizeEvent then pendingMinimizeStates.Remove(hwnd) |> ignore
+        let minimizeReady =
+            if minimizeEvent && this.windows.contains(hwnd) then
+                let expected = evt=WinEvent.EVENT_SYSTEM_MINIMIZESTART
+                if this.os.windowFromHwnd(hwnd).isMinimized=expected then true
+                else
+                    pendingMinimizeStates.[hwnd] <- expected,transitionClock.ElapsedMilliseconds+1000L
+                    minimizeStateTimer.Start()
+                    false
+            else true
+        // Acknowledge our own propagated events instead of reissuing the group
+        // operation. An older event cannot reverse a newer request still in flight.
+        let propagated =
+            if minimizeEvent then
+                match requestedMinimizeStates.TryGetValue(hwnd) with
+                | true,expected ->
+                    let observed = evt=WinEvent.EVENT_SYSTEM_MINIMIZESTART
+                    if expected=observed then
+                        if minimizeReady then requestedMinimizeStates.Remove(hwnd) |> ignore
+                        true
+                    elif FollowerPlacement.isChangingMinimizeState placementOwner hwnd then true
+                    else requestedMinimizeStates.Remove(hwnd) |> ignore; false
+                | _ -> false
+            else false
+        match evt with
+        | WinEvent.EVENT_SYSTEM_MINIMIZESTART -> 
+            // Queued notifications may be overtaken by a fast restore.
+            if minimizeReady && this.windows.contains(hwnd) && this.os.windowFromHwnd(hwnd).isMinimized then
+                this.os.windowFromHwnd(hwnd).parkIfMinimized()
+                if not propagated then
+                    this.reclaimLeftTab(hwnd)
+                    let needsMinimized = zorderCell.value.any <| fun hwnd -> this.os.windowFromHwnd(hwnd).isMinimized.not
+                    if needsMinimized then
+                        minimizedFrom <- Some hwnd
+                        this.minimizeAll()
+                        this.os.setZorder(zorderCell.value.moveToEnd((=)hwnd))
+                this.updateIsVisible()
+        //this happens when a window is restored from minimize
+        | WinEvent.EVENT_SYSTEM_MINIMIZEEND ->
+            if minimizeReady && this.windows.contains(hwnd) && this.os.windowFromHwnd(hwnd).isMinimized.not then
+                if not propagated then
+                    let needsRestore = zorderCell.value.any <| fun hwnd -> this.os.windowFromHwnd(hwnd).isMinimized
+                    if needsRestore then
+                        // The tab restored comes back in front of the others.
+                        this.setZorder(zorderCell.value.where((<>) hwnd).prepend hwnd)
+                        this.restoreAll()
+                        this.os.setZorder(zorderCell.value.moveToEnd((=)hwnd))
+                this.updateIsVisible()      
+                //foreground status may have changed
+                this.foreground <- this.os.foreground.hwnd
+        | WinEvent.EVENT_OBJECT_REORDER ->
+            this.saveZorder()
+        | WinEvent.EVENT_OBJECT_NAMECHANGE ->
+            if  this.windows.contains(hwnd) &&
+                //some windows (e.g. chrome on GoogleAnalitics page) fire namechange constantly as they are resized
+                inMoveSize.value.not 
+                then
+                this.setTabInfo hwnd
+        | WinEvent.EVENT_SYSTEM_MOVESIZESTART ->
+            if this.isTop(hwnd) then
+                this.onEnterMoveSize()
+
+        | WinEvent.EVENT_SYSTEM_MOVESIZEEND ->
+            if this.isTop(hwnd) then 
+                this.onExitMoveSize()
+
+        //this is here to detect transitions between maximized and
+        //restored (both directions). MOVESIZE does not get triggered in this case
+        //however, we need to be careful because some apps (Skype.exe) will trigger this
+        //event when they loose focus, we don't want to automatically give them focus in this case
+        //so make sure that the window HAD focus before reapplying it
+        | WinEvent.EVENT_OBJECT_LOCATIONCHANGE ->
+            if this.isTop(hwnd) && inMoveSize.value.not then
+                //you can miss EVENT_SYSTEM_MOVESIZESTART events
+                //when a window is created and is immediatly in move size, we subscribe
+                //to the event too late (Chrome tab dragging is prime example)
+                //could be solved by subscribing only once for MOVESIZESTART gobally for all hwnds
+                //but instead, to keep it simple, we just check on all location changes if its in move size
+                let window = this.os.windowFromHwnd(hwnd)
+                if window.isInMoveSize then
+                    this.onEnterMoveSize()
+                else
+                    let isForeground = this.os.foreground.hwnd = hwnd
+                    this.saveTopWindowPlacement()
+                    this.adjustChildWindows()
+                    if isForeground then
+                        this.makeTopWindowForeground()
+                    this.foreground <- this.os.foreground.hwnd
+                    isMaximizedExport.update()
+                    this.fitWorkspace()
+        | WinEvent.EVENT_SYSTEM_FOREGROUND ->
+            // Activated some other way (Alt+Tab, its own window), an owned tab can stay under the
+            // others in the same way as one activated from the strip.
+            if this.windows.contains(hwnd) then
+                let window = this.os.windowFromHwnd(hwnd)
+                if window.isOwned && not window.isMinimized then window.raise()
+            this.foreground <- hwnd
+            this.followClosedTab(this.os.foreground.hwnd)
+            this.saveZorder()
+            // Windows can hide an owned strip during minimize/restore after our last
+            // update. Reconcile even when focus and tab order have not changed.
+            if this.windows.contains(hwnd) then
+                this.saveTopWindowPlacement()
+                this.updateIsVisible()
+            this.ts.refreshShadow()
+        | WinEvent.EVENT_OBJECT_HIDE | WinEvent.EVENT_OBJECT_DESTROY ->
+            this.reclaimLeftTab(hwnd)
+            if lastActiveTab=Some hwnd then this.followClosedTab(this.os.foreground.hwnd)
+        | WinEvent.EVENT_OBJECT_CLOAKED | WinEvent.EVENT_OBJECT_UNCLOAKED ->
+            if this.windows.contains(hwnd) then this.updateIsVisible()
+        | _ -> ()
+      
+    member this.addWindow(hwnd, withDelay) = this.withUpdate <| fun() ->
+       if not isDestroyed.value && this.windows.contains(hwnd).not then
+            if withDelay then System.Threading.Thread.Sleep(250)
+            let window = this.os.windowFromHwnd(hwnd)                
+            let window = this.os.windowFromHwnd(hwnd)
+            if this.windows.isEmpty && not hasSavedTabLayout then WindowTabLayout.read hwnd |> Option.iter this.applyTabLayout
+            this.setWindows(this.windows.add hwnd)
+            WindowGroupToken.save hwnd this.groupToken
+            FollowerPlacement.queue.claim(placementOwner,hwnd)
+            if prevTop.value.IsNone then
+                prevTop.set(Some(hwnd))
+                this.saveTopWindowPlacement()
+            let registerEvent evt = 
+                let handler = fun() -> this.main(hwnd, evt)
+                window.setWinEventHook evt handler
+            let hooks = 
+                List2([
+                    WinEvent.EVENT_OBJECT_NAMECHANGE
+                    WinEvent.EVENT_OBJECT_LOCATIONCHANGE
+                    WinEvent.EVENT_SYSTEM_MOVESIZESTART
+                    WinEvent.EVENT_SYSTEM_MOVESIZEEND
+                    WinEvent.EVENT_SYSTEM_MINIMIZESTART
+                    WinEvent.EVENT_SYSTEM_MINIMIZEEND
+                    WinEvent.EVENT_OBJECT_HIDE
+                    WinEvent.EVENT_OBJECT_DESTROY
+                    WinEvent.EVENT_OBJECT_CLOAKED
+                    WinEvent.EVENT_OBJECT_UNCLOAKED
+                ]).map(registerEvent)
+            let dispose = 
+                {
+                    new IDisposable with
+                        member this.Dispose() = hooks.iter(fun h -> h.Dispose())
+                }
+            hookCleanup.map(fun hooks -> hooks.add hwnd dispose)
+            StartupTrace.measure "group.add.info" (fun () -> this.setTabInfo hwnd)
+            StartupTrace.measure "group.add.strip" (fun () -> this.ts.addTab(Tab(hwnd)))
+            StartupTrace.measure "group.add.colors" this.refreshTabColors
+            if IdeMode.isOn() then this.refreshTabNames()
+            // Only a window that opens in the foreground has an opener. Windows found at
+            // startup or dropped in the background then close like any other tab.
+            let foreground = this.os.foreground.hwnd
+            if foreground=hwnd then
+                opener <- lastActiveTab |> Option.filter(fun owner -> owner<>hwnd && this.windows.contains(owner) && isOpen owner) |> Option.map(fun owner -> hwnd,owner)
+            lastActiveTab <- TabNavigation.rememberActive this.lorder.list isOpen lastActiveTab foreground
+            if this.fillsWorkspace then IdeMode.Restore.remember hwnd window.placement
+            elif not isWorkspaceGroup then IdeMode.Restore.forget hwnd
+            StartupTrace.measure "group.add.placement" (fun () -> this.adjustWindowPlacement(hwnd))
+            if hasSavedTabLayout then WindowTabLayout.save hwnd this.tabLayout
+            StartupTrace.measure "group.add.notify" (fun () -> addedEvent.Trigger(hwnd))
+            // A visible window joining a minimized group restores it, as restoring any tab does,
+            // so closing that window shows the previous tab instead of minimizing the group again.
+            let others = this.windows.items.where((<>) hwnd)
+            if not window.isMinimized && not others.isEmpty && others.all isMinimized then
+                this.setZorder(zorderCell.value.where((<>) hwnd).prepend hwnd)
+                others.iter(fun other ->
+                    requestedMinimizeStates.[other] <- false
+                    FollowerPlacement.queue.submit(placementOwner,other,FollowerPlacement.restoreBelowRequest other hwnd))
+                this.watchMinimizeCompletion()
+            this.fitWorkspace()
+
+    member this.removeWindow(hwnd) = this.withUpdate <| fun() ->
+        inputOwnership.Remove hwnd |> ignore
+        if not isDestroyed.value && this.windows.contains(hwnd) then
+            this.reclaimLeftTab(hwnd)
+            let foreground = this.os.foreground.hwnd
+            let next = TabNavigation.closeTarget this.lorder.list isOpen hwnd foreground lastActiveTab opener (this.leftOnClose hwnd)
+            if opener |> Option.exists(fun (tab,owner) -> tab=hwnd || owner=hwnd) then opener <- None
+            FollowerPlacement.queue.release(placementOwner,hwnd)
+            //CASE 777 - chrome windows can close when you merge a single chrome tab
+            //into another chrome group, need to exit the move/size and restore windows on screen in this case
+            if inMoveSize.value then
+                this.onExitMoveSize()
+            let window = this.os.windowFromHwnd(hwnd)
+            this.ts.removeTab(Tab(hwnd))
+            tabColors <- tabColors.Remove hwnd
+            this.setWindows(this.windows.remove hwnd)
+            hookCleanup.value.find(hwnd).Dispose()
+            hookCleanup.map(fun hooks -> hooks.remove(hwnd))
+            removedEvent.Trigger(hwnd)
+            pendingMinimizeStates.Remove(hwnd) |> ignore
+            requestedMinimizeStates.Remove(hwnd) |> ignore
+            iconCache.remove(hwnd)
+            if IdeMode.isOn() then this.refreshTabNames()
+            // An editor leaving the workspace other than by a drag (which places it where it is
+            // dropped) gets back the placement it had before it joined.
+            if not isDraggingCell.value && WinUserApi.IsWindow(hwnd) then
+                IdeMode.Restore.take hwnd |> Option.iter(fun saved -> window.setPlacement({saved with showCmd=IdeMode.Restore.showCmd saved}))
+            // The successor, not the current foreground: Windows may still show the tab it
+            // activated itself while our selection is on its way.
+            let successor =
+                match followedClose with
+                | Some(closed,target) when closed=hwnd -> Some target
+                | _ -> next
+            if lastActiveTab=Some hwnd then
+                lastActiveTab <-
+                    match successor with
+                    | Some target -> Some target
+                    | None -> if this.windows.contains(foreground) then Some foreground else None
+            if followedClose |> Option.exists(fun (closed,_) -> closed=hwnd) then followedClose <- None
+            else next |> Option.iter(fun target -> this.tabActivate(Tab(target),false))
+
+    /// The foreground left this tab just before it closed or minimized: it is still the active tab.
+    member private this.reclaimLeftTab(hwnd) =
+        if lastActiveTab<>Some hwnd && (not(isOpen hwnd) || isMinimized hwnd) &&
+           TabNavigation.leftJustBefore leftTab hwnd lastActiveTab transitionClock.ElapsedMilliseconds then
+            lastActiveTab <- Some hwnd
+            opener <- leftOpener
+            leftTab <- None
+
+    /// The group's last foreground event is still this tab, or the foreground left it for
+    /// another application just before it closed: Windows chose that window for the close.
+    member private this.leftOnClose(hwnd) =
+        foregroundCell.value=hwnd || TabNavigation.leftGroupJustBefore leftGroup hwnd transitionClock.ElapsedMilliseconds
+
+    /// Windows activates the previously used window when a tab closes, before discovery
+    /// removes it. Select the successor as soon as the active tab is hidden, destroyed or
+    /// loses the foreground, so the wrong tab shows as briefly as possible.
+    member private this.followClosedTab(foreground) =
+        match lastActiveTab with
+        | Some closed when followedClose |> Option.forall(fun (followed,_) -> followed<>closed) ->
+            TabNavigation.closeTarget this.lorder.list isOpen closed foreground lastActiveTab opener (this.leftOnClose closed)
+            |> Option.iter(fun target ->
+                if target<>foreground then this.tabActivate(Tab(target),false)
+                // Activation can be refused; a later foreground event or removal retries.
+                if this.os.foreground.hwnd=target then followedClose <- Some(closed,target))
+        | _ -> ()
+
+    member this.activateIndex(index, force) =
+        let nextTab = this.ts.lorder.tryAt(index)
+        nextTab.iter <| fun(nextTab) ->
+            this.tabActivate(nextTab, force)
+
+    member this.switchWindow(next,force) = 
+        if this.windowCount > 1 then
+            // A second shortcut can arrive before the foreground WinEvent from
+            // the previous activation. Navigate from the actual foreground HWND
+            // instead of repeating/skipping a tab from the delayed snapshot.
+            let foreground = this.os.foreground.hwnd
+            let order = this.ts.lorder.list |> List.map(fun(Tab(hwnd)) -> hwnd)
+            TabNavigation.targetIndex order foreground zorderCell.value.tryHead next
+            |> Option.iter(fun index -> this.activateIndex(index, force))
+                        
+    /// A plugin can retain its native owners until asynchronous shell registration finishes.
+    member _.addExitPreparation(action:(unit -> unit) -> unit) = exitPreparations.Add action
+
+    member private this.finishDestroy() =
+        this.ts.destroy()
+        shellHookWindow.value.iter <| fun d -> d.Dispose()
+        winEventHandler.value.iter <| fun d -> d.Dispose()
+        exitedEvent.Trigger()
+        (iconCache :> IDisposable).Dispose()
+        (invoker :> IDisposable).Dispose()
+
+    member this.destroy() =
+        if isDestroyed.value.not then
+            isDestroyed.set(true)
+            placementCompletion |> Option.iter(fun subscription -> subscription.Dispose())
+            placementCompletion <- None
+            this.windows.items.iter(fun hwnd -> FollowerPlacement.queue.release(placementOwner,hwnd))
+            lock locationGate (fun () -> pendingLocations.Clear())
+            minimizeStateTimer.Dispose()
+            pendingMinimizeStates.Clear()
+            requestedMinimizeStates.Clear()
+            hookCleanup.value.values.iter(fun hook -> hook.Dispose())
+            hookCleanup.set(Map2())
+            themeSubscription |> Option.iter (fun subscription -> subscription.Dispose())
+            themeSubscription <- None
+            let rec prepare index =
+                if index=exitPreparations.Count then this.finishDestroy()
+                else
+                    let mutable completed = false
+                    exitPreparations.[index](fun () -> invoker.asyncInvoke(fun () ->
+                        if not completed then
+                            completed <- true
+                            prepare (index+1)))
+            prepare 0
+
+   
+
+    /// Minimized, or about to be by a group minimize in progress.
+    member private this.isMinimizing hwnd =
+        isMinimized hwnd ||
+        (match requestedMinimizeStates.TryGetValue(hwnd) with | true,minimized -> minimized | _ -> false)
+
+    /// Skips windows already there with no request of ours in flight. The tab that started the
+    /// change never acknowledges a request, and while it is queued that tab's next change looks like ours.
+    member private this.needsMinimizeState minimized hwnd =
+        isMinimized hwnd<>minimized || requestedMinimizeStates.ContainsKey hwnd
+
+    member private this.watchMinimizeCompletion() =
+        reconcileMinimizeState <- true
+        this.finishPlacementReconciliation()
+
+    member this.minimizeAll = fun() ->
+        zorderCell.value.reverse.where(this.needsMinimizeState true).iter <| fun hwnd ->
+            requestedMinimizeStates.[hwnd] <- true
+            FollowerPlacement.queue.submit(placementOwner,hwnd,FollowerPlacement.minimizeRequest hwnd true)
+        this.watchMinimizeCompletion()
+        
+    member this.restoreAll = fun() ->
+        // Each tab goes back below the one restored first, which stays in front.
+        let top = zorderCell.value.where(isMinimized >> not).tryHead
+        zorderCell.value.where(this.needsMinimizeState false).iter <| fun hwnd ->
+            requestedMinimizeStates.[hwnd] <- false
+            let request =
+                match top with
+                | Some top when top<>hwnd -> FollowerPlacement.restoreBelowRequest hwnd top
+                | _ -> FollowerPlacement.minimizeRequest hwnd false
+            FollowerPlacement.queue.submit(placementOwner,hwnd,request)
+        this.watchMinimizeCompletion()
+        
+    member this.tabActivate(Tab(hwnd), force) =
+        let window = this.os.windowFromHwnd(hwnd)
+        // The strip is owned by the top window and only follows a new top window once the
+        // foreground event comes back through the group. Until then the activated window
+        // covers it, which flashes whenever the tabs sit inside the title bar. Owned windows
+        // are raised with their owner, so hand the strip over before activating.
+        if this.windows.contains(hwnd) then this.setTsOwner(window)
+        window.setForegroundOrRestore(force)
+        window.bringToTop()
+        // Activated but still under the other tabs when its owner is a combined taskbar's preview;
+        // only once it is in front, as a refused activation leaves the strip with the real top window.
+        if this.os.foreground.hwnd=hwnd then window.raise()
+        if this.os.foreground.hwnd=hwnd then lastActiveTab <- Some hwnd
+        // Activation can be refused (foreground lock); keep the strip with the real top window.
+        this.inZorder(this.windows.items).tryHead |> Option.iter (fun top ->
+            if top <> hwnd then this.setTsOwner(this.os.windowFromHwnd(top)))
+
+    member this.onTabMoved(hwnd, index) = movedEvent.Trigger(hwnd, index)
+
+    member x.exited = exitedEvent.Publish
+    member this.bounds = boundsExport :> ICellOutput<_>
+    member this.isForeground = isForegroundExport :> ICellOutput<_>
+    member this.zorder = zorderExport :> ICellOutput<_>
+    member this.added = addedEvent.Publish
+    member this.moved = movedEvent.Publish
+    member this.foregroundChanged = foregroundEvent.Publish
+    member this.tabInfoChanged = tabInfoChangedEvent.Publish
+    member this.flash = flashEvent.Publish
+    member this.removed = removedEvent.Publish
+    member this.lorder : List2<IntPtr> = this.ts.lorder.map(fun(Tab(hwnd)) -> hwnd)

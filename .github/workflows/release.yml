@@ -1,0 +1,154 @@
+name: release
+
+# Push a tag such as v0.1.0-alpha.1 to build, test and draft a GitHub release with a ZIP of
+# the unsigned exe and its SHA-256. The draft is reviewed and published by hand.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      executable-artifact-id: ${{ steps.executable.outputs.artifact-id }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Read version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)(-[0-9A-Za-z.-]+)?$') { throw "Tag $tag is not vMAJOR.MINOR.PATCH, e.g. v0.1.0-alpha.1" }
+          "number=$($tag.Substring(1))" >> $env:GITHUB_OUTPUT
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.fsproj', '**/*.csproj', 'dotnet-tools.json') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Build Release
+        run: dotnet build WindowTabs.sln -c Release -p:Version=${{ steps.version.outputs.number }}
+
+      # The settings window, crash reports and settings migration all read this version.
+      - name: Check the executable carries the tag's version
+        shell: powershell
+        env:
+          EXPECTED: ${{ steps.version.outputs.number }}
+        run: ./tests/Check-ReleaseVersion.ps1 -Executable WtProgram/bin/Release/IDE-tabs.exe -ExpectedVersion $env:EXPECTED
+
+      - name: Smoke test isolated Release assembly
+        shell: powershell
+        run: ./tests/Run-ReleaseSmoke.ps1
+
+      - name: Upload IDE-tabs.exe
+        id: executable
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-executable
+          path: WtProgram/bin/Release/IDE-tabs.exe
+          if-no-files-found: error
+
+      - name: Package the release
+        shell: powershell
+        run: ./build/Package-Release.ps1 -Version ${{ steps.version.outputs.number }} -OutputDirectory dist
+
+      - name: Upload the release package
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-package
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload Release diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-diagnostics
+          path: |
+            tests/Debug/*.log
+          if-no-files-found: ignore
+
+  regressions:
+    name: regressions (${{ matrix.group }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: architecture
+            suites: 'Architecture,IdeMode,WindowIcon'
+          - group: operations
+            suites: 'GroupOperations,SettingsEditors'
+          - group: ui
+            suites: 'Reliability,DpiLayout,SettingsTheme,TabShadow,GroupLifecycle,PopupRendering,TabInteraction,TaskbarPreview,PrintWindowProbe'
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.fsproj', '**/*.csproj', 'dotnet-tools.json') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      # Each group owns a separate runner; native suites stay serial within it.
+      - name: Run regression tests serially
+        shell: powershell
+        env:
+          REGRESSION_SUITES: ${{ matrix.suites }}
+        run: ./tests/Run-Tests.ps1 -Suites ($env:REGRESSION_SUITES -split ',')
+
+      - name: Upload regression diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: regression-diagnostics-${{ matrix.group }}
+          path: |
+            tests/Debug/*.log
+            tests/Debug/test-results.jsonl
+          if-no-files-found: ignore
+
+  # Real input against the very file the draft will carry.
+  desktop-e2e:
+    needs: build
+    uses: ./.github/workflows/desktop-e2e-hosted.yml
+    with:
+      profile: Full
+      executable-artifact: release-executable
+
+  draft:
+    needs: [build, regressions, desktop-e2e]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-package
+          path: dist
+
+      - name: Draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          $flags = @('--draft', '--notes-file', 'dist/release-notes.md', '--title', "IDE-tabs $env:TAG", '--repo', '${{ github.repository }}')
+          if ($env:TAG -match '^v\d+\.\d+\.\d+-') { $flags += '--prerelease' }
+          $files = @(Get-ChildItem dist -Filter *.zip | ForEach-Object FullName) + 'dist/SHA256SUMS.txt'
+          gh release create $env:TAG @files @flags

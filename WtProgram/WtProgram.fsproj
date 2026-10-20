@@ -1,0 +1,165 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>IDE-tabs</AssemblyName>
+    <RootNamespace>WindowTabs</RootNamespace>
+    <ApplicationIcon>Resources\IDE-tabs.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- The release workflow sets the version from the tag (-p:Version=2026.10.10); any
+         other build reports 0.0.0-dev so it is never mistaken for a release. -->
+    <InformationalVersion Condition="'$(Version)' == ''">0.0.0-dev</InformationalVersion>
+    <!-- Shown to users (tray, settings, crash log), so no "+commit" suffix. -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <AssemblyTitle>IDE-tabs</AssemblyTitle>
+    <Product>IDE-tabs</Product>
+    <Description>One workspace for your Cursor and VS Code projects</Description>
+    <Company>IDE-tabs contributors</Company>
+    <Copyright>Licensed under the terms in LICENSE</Copyright>
+    <!-- Keep bin\<Configuration>\ so scripts and CI find WindowTabs.exe where they always have. -->
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- FSharp.Core ships translated messages for many cultures; the app only needs the neutral ones. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <WarningLevel>3</WarningLevel>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <Tailcalls>false</Tailcalls>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <Tailcalls>true</Tailcalls>
+    <!-- Release is a single self-contained WindowTabs.exe. -->
+    <OtherFlags>$(OtherFlags) --standalone --staticlink:Win32</OtherFlags>
+    <!-- FS2011: framework internals (SMDiagnostics, System.ServiceModel.Internals) reached through
+         System.Runtime.Serialization are not in the reference assemblies; they stay in the GAC, not the exe. -->
+    <NoWarn>$(NoWarn);2009;2011</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="Shared\JsonDom.fs" />
+    <Compile Include="Shared\Operators.fs" />
+    <Compile Include="Shared\Dynamic.fs" />
+    <Compile Include="Shared\Observable.fs" />
+    <Compile Include="Shared\Blackboard.fs" />
+    <Compile Include="Shared\Invoker.fs" />
+    <Compile Include="Shared\Lifetime.fs" />
+    <Compile Include="Shared\BackgroundWork.fs" />
+    <Compile Include="Shared\Cell.fs" />
+    <Compile Include="Shared\Drawing.fs" />
+    <Compile Include="Shared\Sprite.fs" />
+    <Compile Include="Shared\TabStripTypes.fs" />
+    <Compile Include="Shared\Dpi.fs" />
+    <Compile Include="Shared\Win32.fs" />
+    <Compile Include="Shared\VirtualDesktop.fs" />
+    <Compile Include="Shared\WindowIconCache.fs" />
+    <Compile Include="Shared\WindowPlacementQueue.fs" />
+    <Compile Include="Shared\AppearanceModel.fs" />
+    <Compile Include="Shared\ProgramTypes.fs" />
+    <Compile Include="Shared\Localization.fs" />
+    <Compile Include="Shared\Strings.fs" />
+    <Compile Include="Shared\Alert.fs" />
+    <Compile Include="Shared\SettingsCatalog.fs" />
+    <Compile Include="Shared\SettingsShortcut.fs" />
+    <Compile Include="Shared\DragDrop.fs" />
+    <Compile Include="Shared\Serialize.fs" />
+    <Compile Include="Shared\Win32Menu.fs" />
+    <Compile Include="Shared\Services.fs" />
+    <Compile Include="Shared\AppIdentity.fs" />
+    <Compile Include="Shared\IdeMode.fs" />
+    <Compile Include="Shared\NumberShortcutRules.fs" />
+    <Compile Include="Shared\AppGroupingRules.fs" />
+    <Compile Include="Shared\RuntimeDiagnostics.fs" />
+    <Compile Include="Shared\Theme.fs" />
+    <Compile Include="Shared\ThemePresets.fs" />
+    <Compile Include="Shared\ThemeService.fs" />
+    <Compile Include="Shared\SettingsColors.fs" />
+    <Compile Include="Shared\ThemedMenu.fs" />
+    <Compile Include="Shared\AnimationWindow.fs" />
+    <Compile Include="Shared\Forms.fs" />
+    <Compile Include="Shared\Json.fs" />
+    <Compile Include="Shared\Shell.fs" />
+    <Compile Include="Shared\Model.fs" />
+    <Compile Include="Shared\UIHelper.fs" />
+    <Compile Include="HotKeyManager.fs" />
+    <Compile Include="DragDropController.fs" />
+    <Compile Include="TabStripSprite.fs" />
+    <Compile Include="TabShadow.fs" />
+    <Compile Include="TabTitleTip.fs" />
+    <Compile Include="TabStrip.fs" />
+    <Compile Include="AppearanceJson.fs" />
+    <Compile Include="SettingsFileStore.fs" />
+    <Compile Include="RememberedGroups.fs" />
+    <Compile Include="Settings.fs" />
+    <Compile Include="WindowDecorator.fs" />
+    <Compile Include="OleDropTarget.fs" />
+    <Compile Include="WindowGroup.fs" />
+    <Compile Include="TabStripDecorator.fs" />
+    <Compile Include="GroupPlugins\SuperBarPlugin.fs" />
+    <Compile Include="GroupPlugins\MouseScrollPlugin.fs" />
+    <Compile Include="GroupPlugins\NumericTabHotKeyPlugin.fs" />
+    <Compile Include="GroupPlugins\HideTabsOnInactiveGroupPlugin.fs" />
+    <Compile Include="Desktop.fs" />
+    <Compile Include="Workspace\WorkspaceData.fs" />
+    <Compile Include="Workspace\WorkspaceModel.fs" />
+    <Compile Include="ManagerViewService\ThemeBinding.fs" />
+    <Compile Include="ManagerViewService\SettingsStyle.fs" />
+    <Compile Include="ManagerViewService\SettingsControls.fs" />
+    <Compile Include="ManagerViewService\SettingsEditors.fs" />
+    <Compile Include="ManagerViewService\SettingsPage.fs" />
+    <Compile Include="ManagerViewService\SettingsUi.fs" />
+    <Compile Include="ManagerViewService\SettingsAlert.fs" />
+    <Compile Include="ManagerViewService\SettingsTreeList.fs" />
+    <Compile Include="ManagerViewService\SettingsBindings.fs" />
+    <Compile Include="ManagerViewService\SettingsListPage.fs" />
+    <Compile Include="ManagerViewService\Views\GeneralView.fs" />
+    <Compile Include="ManagerViewService\Views\AppGroupingRulesView.fs" />
+    <Compile Include="ManagerViewService\Views\AppearanceView.fs" />
+    <Compile Include="ManagerViewService\Views\HotKeyView.fs" />
+    <Compile Include="ManagerViewService\Views\DiagnosticsView.fs" />
+    <Compile Include="ManagerViewService\Views\ProgramView.fs" />
+    <Compile Include="ManagerViewService\Views\WorkspaceView.fs" />
+    <Compile Include="ManagerViewService\Views\IdeTabsView.fs" />
+    <Compile Include="ManagerViewService\DesktopManagerForm.fs" />
+    <Compile Include="ManagerViewService\ManagerViewService.fs" />
+    <Compile Include="FilterService.fs" />
+    <Compile Include="DesktopPlugins\InputManagerPlugin.fs" />
+    <Compile Include="DesktopPlugins\NotifyIconPlugin.fs" />
+    <Compile Include="DesktopPlugins\ExceptionHandlerPlugin.fs" />
+    <Compile Include="TaskSwitch.fs" />
+    <Compile Include="TabSearch.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Loaded by file name (GetManifestResourceStream "IDE-tabs.ico"), so keep the bare names. -->
+    <EmbeddedResource Include="Resources\*.ico" LogicalName="%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Update="FSharp.Core" Version="10.1.401" />
+    <Reference Include="System.Windows.Forms" />
+    <ProjectReference Include="..\Win32\Win32.csproj" />
+  </ItemGroup>
+
+  <!-- A running Debug copy locks its exe and DLLs. Windows lets a running file be renamed, so they
+       are moved aside before the copy, and a new Debug instance then replaces the running one.
+       Files left from earlier runs are deleted once nothing has them open. Only for the project's
+       own output folder: a build into a shared folder (-o) also holds Win32's fresh output. -->
+  <Target Name="MoveRunningDebugOutput" BeforeTargets="_CopyFilesMarkedCopyLocal;CopyFilesToOutputDirectory"
+          Condition="'$(Configuration)'=='Debug' and !$([System.IO.Path]::IsPathRooted('$(OutDir)'))">
+    <ItemGroup>
+      <_EarlierRunFiles Include="$(OutDir)*.running-*" />
+      <_RunningOutput Include="$(OutDir)IDE-tabs.exe" Condition="Exists('$(OutDir)IDE-tabs.exe')" />
+      <_RunningOutput Include="$(OutDir)IDE-tabs.pdb" Condition="Exists('$(OutDir)IDE-tabs.pdb')" />
+      <_RunningOutput Include="$(OutDir)Win32.dll" Condition="Exists('$(OutDir)Win32.dll')" />
+      <_RunningOutput Include="$(OutDir)Win32.pdb" Condition="Exists('$(OutDir)Win32.pdb')" />
+    </ItemGroup>
+    <Delete Files="@(_EarlierRunFiles)" ContinueOnError="true" />
+    <Move SourceFiles="@(_RunningOutput)" DestinationFiles="@(_RunningOutput->'%(FullPath).running-$([System.DateTime]::Now.Ticks)')" ContinueOnError="true" />
+  </Target>
+
+</Project>

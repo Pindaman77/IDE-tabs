@@ -1,0 +1,64 @@
+name: Bug report
+description: Something in IDE-tabs does not work as described.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying IDE-tabs. Please check the [known limitations](https://github.com/Pindaman77/IDE-tabs/blob/main/docs/known-limitations.md) first.
+        Do not paste window titles, file paths or project names you would rather keep private.
+  - type: dropdown
+    id: editor
+    attributes:
+      label: Editor
+      options:
+        - Cursor
+        - Visual Studio Code
+        - Both
+        - Neither (IDE-tabs itself)
+    validations:
+      required: true
+  - type: input
+    id: editor-version
+    attributes:
+      label: Editor version
+      description: In the editor, Help → About.
+      placeholder: "Cursor 2.4.0"
+  - type: input
+    id: ide-tabs-version
+    attributes:
+      label: IDE-tabs version
+      description: Shown at the bottom of the IDE-tabs settings.
+      placeholder: "v0.1.0-alpha.1"
+    validations:
+      required: true
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: Run `winver`, or see Settings → System → About.
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open two projects in Cursor
+        2. Press Alt+Tab to Chrome and back
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Troubleshooting report (optional)
+      description: In the IDE-tabs settings, choose Troubleshooting… and copy the report. It leaves out window titles and paths.
+      render: json

@@ -1,0 +1,377 @@
+namespace Bemo
+open System
+open System.Drawing
+open System.Windows.Forms
+
+/// The tab text on each tab colour where it is adjusted: as chosen and as shown, with the
+/// contrast of each, so the change can be judged by eye.
+type ContrastComparison() as this =
+    inherit Control()
+    let mutable samples : (string*Color*Color*Color) list = []
+    let chipWidth,chipHeight,gap = Dpi.scale 168,Dpi.scale 32,Dpi.scale 10
+    let captionFont = SettingsUi.font "Segoe UI" 9.0f FontStyle.Regular
+    let columns () = max 1 ((this.Width+gap)/(chipWidth+gap))
+    let rowHeight () = chipHeight+Dpi.scale 4+captionFont.Height+gap
+    let fit () =
+        let rows = (samples.Length+columns()-1)/columns()
+        this.Height <- rows*rowHeight()
+    do
+        this.SetStyle(ControlStyles.UserPaint ||| ControlStyles.OptimizedDoubleBuffer ||| ControlStyles.AllPaintingInWmPaint,true)
+        this.Tag <- "color-swatch"
+        this.Margin <- Padding(0,Dpi.scale 10,0,0)
+    /// Each as the tab name, its colour, the text as chosen and the text as shown.
+    member this.Samples
+        with get() = samples
+        and set value =
+            samples <- value
+            this.Visible <- not value.IsEmpty
+            fit()
+            this.Invalidate()
+    override this.OnResize e =
+        base.OnResize e
+        fit()
+        this.Invalidate()
+    override this.OnPaint e =
+        let p = SettingsUi.palette()
+        let g = e.Graphics
+        g.Clear(p.background)
+        samples |> List.iteri(fun index (name,background,before,after) ->
+            let x = (index%columns())*(chipWidth+gap)
+            let y = (index/columns())*rowHeight()
+            let chip = Rectangle(x,y,chipWidth,chipHeight)
+            use fill = new SolidBrush(background)
+            g.FillRectangle(fill,chip)
+            let half = chipWidth/2
+            let flags = TextFormatFlags.HorizontalCenter ||| TextFormatFlags.VerticalCenter ||| TextFormatFlags.NoPrefix ||| TextFormatFlags.SingleLine
+            TextRenderer.DrawText(g,tr Strings.Appearance.textBefore,this.Font,Rectangle(x,y,half,chipHeight),before,background,flags)
+            TextRenderer.DrawText(g,tr Strings.Appearance.textAfter,this.Font,Rectangle(x+half,y,half,chipHeight),after,background,flags)
+            let caption = sprintf "%s  %.1f → %.1f" name (TextContrast.ratio before background) (TextContrast.ratio after background)
+            TextRenderer.DrawText(g,caption,captionFont,Point(x,y+chipHeight+Dpi.scale 4),p.muted,p.background,TextFormatFlags.NoPrefix))
+
+/// The tab preview, double-buffered so redrawing its tabs on a colour edit does not flicker.
+type TabPreview() as this =
+    inherit Panel()
+    do
+        this.DoubleBuffered <- true
+        this.ResizeRedraw <- true
+    member val Position = TabDockTop with get,set
+    member val ColumnWidth = 220 with get,set
+    member this.TabBounds(tabHeight:int) =
+        let inset = Dpi.scale 16
+        let width = max 1 (this.ClientSize.Width-inset*2)
+        if this.Position=TabDockTop then Rectangle(inset,Dpi.scale 14,width,tabHeight+2)
+        else
+            let column = min (Dpi.scale this.ColumnWidth) (max 1 (width-Dpi.scale 64))
+            let x = if this.Position=TabDockLeft then inset else inset+width-column
+            Rectangle(x,Dpi.scale 14,column,3*(max (Dpi.scale 32) tabHeight+Dpi.scale 4)+Dpi.scale 4)
+
+type AppearanceView(?settings:ISettings) =
+    let settings = defaultArg settings Services.settings
+    let panel,table = SettingsUi.page()
+    let mutable refreshing = false
+    let mutable editingDark = ThemeService.currentIsDark()
+    let update = settings.updateAppearance
+    let preset = SettingsUi.choice (Array.append (ThemePresets.names |> Array.map tr) [|tr Strings.Appearance.custom|])
+    let tabStyle = SettingsUi.choice (Strings.Appearance.tabStyles |> Array.map tr)
+    let resetColorsButton = new SettingsResetButton(tr Strings.Appearance.resetColors,Name="reset-colors")
+    let resetLayoutButton = new SettingsResetButton(tr Strings.Appearance.resetTabLayout,Name="reset-tab-layout")
+    let paletteForProfile (s:AppearancePreferences) = if editingDark then s.darkPalette else s.lightPalette
+    let customForProfile (s:AppearancePreferences) = if editingDark then s.darkCustomPalette else s.lightCustomPalette
+    let activePalette (s:AppearancePreferences) =
+        if s.useCustomColors then paletteForProfile s
+        elif editingDark then Theme.darkPalette else Theme.lightPalette
+    let setActive palette (s:AppearancePreferences) =
+        if editingDark then {s with darkPalette=palette;useCustomColors=true}
+        else {s with lightPalette=palette;useCustomColors=true}
+    let setCustom palette (s:AppearancePreferences) =
+        if editingDark then {s with darkCustomPalette=palette} else {s with lightCustomPalette=palette}
+    let values (p:TabPalette) =
+        [p.tabTextColor;p.tabActiveBgColor;p.tabHighlightBgColor;p.tabNormalBgColor;p.tabBorderColor;p.tabFlashBgColor]
+        |> List.map(fun c -> c.ToArgb())
+    let original index = (ThemePresets.palettes editingDark).[index]
+    let editKey index = (if editingDark then "dark:" else "light:")+ThemePresets.keys.[index]
+    /// A preset as the user left it: its own colours with their edits.
+    let presetPalette (s:AppearancePreferences) index = s.presetEdits.TryFind(editKey index) |> Option.defaultValue (original index)
+    let setPreset key (s:AppearancePreferences) = if editingDark then {s with darkPreset=key} else {s with lightPreset=key}
+    /// The chosen entry: Some preset, or None for Custom. Settings from before the choice was
+    /// stored are matched by their colours.
+    let selection (s:AppearancePreferences) =
+        match if editingDark then s.darkPreset else s.lightPreset with
+        | key when key=ThemePresets.customKey -> None
+        | key when Array.contains key ThemePresets.keys -> Some(Array.findIndex ((=) key) ThemePresets.keys)
+        | _ -> ThemePresets.palettes editingDark |> Array.tryFindIndex(fun candidate -> values candidate=values (activePalette s))
+    /// A colour edit changes the chosen entry: the preset keeps it as its own edit, or Custom
+    /// takes it. An edit back to a preset's own colours is no longer an edit.
+    let editPalette change =
+        update(fun s ->
+            let current = activePalette s
+            let next = change current |> Theme.followSeparator (selection s |> Option.map original) current
+            if values next=values current then s
+            else
+                match selection s with
+                | None -> s |> setActive next |> setCustom next |> setPreset ThemePresets.customKey
+                | Some index ->
+                    let edits = if values next=values (original index) then s.presetEdits.Remove(editKey index) else s.presetEdits.Add(editKey index,next)
+                    {(setActive next s) with presetEdits=edits} |> setPreset ThemePresets.keys.[index])
+    let choosePreset index = update(fun s -> s |> setActive (presetPalette s index) |> setPreset ThemePresets.keys.[index])
+    let chooseCustom() = update(fun s -> s |> setActive (customForProfile s) |> setPreset ThemePresets.customKey)
+    /// The chosen preset's own colours again; from Custom, the Default preset.
+    let resetColors() =
+        update(fun s ->
+            let index = selection s |> Option.defaultValue 0
+            {(setActive (original index) s) with presetEdits=s.presetEdits.Remove(editKey index)} |> setPreset ThemePresets.keys.[index])
+    let preview = new TabPreview(Name="tab-preview",Height=Dpi.scale 145,Margin=Padding(0,Dpi.scale 4,0,0),
+                                 AccessibleName=tr Strings.Appearance.explorerPreview)
+    /// Where the preview draws its tabs: all that a colour edit changes.
+    let previewTabs() =
+        preview.TabBounds(ThemeService.currentAppearance().scaled.tabHeight)
+    /// What the rest of the preview is drawn from besides its size, so it is redrawn only when one changes.
+    let mutable previewFrame = None
+    let colorFields : (string * (TabPalette -> Color) * (Color -> TabPalette -> TabPalette)) list = [
+        "tabTextColor",(fun p -> p.tabTextColor),(fun v p -> {p with tabTextColor=v})
+        "tabActiveBgColor",(fun p -> p.tabActiveBgColor),(fun v p -> {p with tabActiveBgColor=v})
+        "tabHighlightBgColor",(fun p -> p.tabHighlightBgColor),(fun v p -> {p with tabHighlightBgColor=v})
+        "tabNormalBgColor",(fun p -> p.tabNormalBgColor),(fun v p -> {p with tabNormalBgColor=v}) ]
+    // The separator follows the text and inactive tab colours, and a flashing tab is rare and
+    // brief: neither earns a row of its own. Each palette still carries both.
+    let colors = colorFields |> List.map(fun (key,get,set) -> key,get,set,(new SettingsColorInput(Font=SettingsUi.bodyFont()) :> IPropEditor))
+    let dimensionFields : (string * (TabGeometry -> int) * (int -> TabGeometry -> TabGeometry)) list = [
+        "tabHeight",(fun g -> g.height),(fun v g -> {g with height=v})
+        "tabMaxWidth",(fun g -> g.maxWidth),(fun v g -> {g with maxWidth=v})
+        "tabOverlap",(fun g -> -g.overlap),(fun v g -> {g with overlap= -v})
+        "tabIndentNormal",(fun g -> g.indentNormal),(fun v g -> {g with indentNormal=v}) ]
+
+    let low,high = SettingsCatalog.columnWidthRange
+    let columnWidth = new SettingsNumberInput(Minimum=decimal low,Maximum=decimal high,Font=SettingsUi.bodyFont())
+    let dimensions = dimensionFields |> List.map(fun (key,get,set) ->
+        let low,high = SettingsCatalog.range key
+        key,get,set,new SettingsNumberInput(Minimum=decimal low,Maximum=decimal high,Font=SettingsUi.bodyFont()))
+    /// Says when the text colour is shown darker or lighter than chosen, so it stays readable.
+    /// Under the Tab colors heading while color coding fills the tabs: the section stays, so a
+    /// search that lands here still finds its settings, and says why they are not offered.
+    let codingNote = new Label(Name="colors-by-coding",AutoSize=true,Tag="muted",UseMnemonic=false,Visible=false,
+                               Text=tr Strings.Appearance.colorsByCoding,Margin=Padding(0,0,0,Dpi.scale 4))
+    let contrastNote = new Label(Name="contrast-note",AutoSize=true,Tag="muted",UseMnemonic=false,Visible=false,Margin=Padding(0,Dpi.scale 8,0,0))
+    let contrastComparison = new ContrastComparison(Name="contrast-comparison",Visible=false)
+    let isFilled() = settings.getValue("tabColorMode") :?> string <> "Off" && settings.getValue("tabColorStyle") :?> string = "Fill"
+    let updateContrastNote (palette:TabPalette) =
+        let text = palette.tabTextColor
+        if isFilled() then
+            // Filled tabs take white text by design, on colours made for it: nothing to explain.
+            contrastComparison.Samples <- []
+            contrastNote.Visible <- false
+            contrastNote.Text <- ""
+        else
+            // A flashing tab is rare and brief, so it is adjusted quietly and left out here.
+            let samples =
+                [ Strings.Settings.tabActiveBgColor,palette.tabActiveBgColor
+                  Strings.Settings.tabHighlightBgColor,palette.tabHighlightBgColor
+                  Strings.Settings.tabNormalBgColor,palette.tabNormalBgColor ]
+                |> List.map(fun (name,background) ->
+                    tr name.caption,background,text,TextContrast.readable text background)
+                |> List.filter(fun (_,_,before,after) -> after <> before)
+            let adjusted = not samples.IsEmpty
+            contrastComparison.Samples <- samples
+            contrastNote.Visible <- adjusted
+            contrastNote.Text <- if adjusted then tr Strings.Appearance.textAdjusted else ""
+    /// Filled by automatic color coding, every tab takes its own color and the text that reads on
+    /// it: the color rows and presets then change nothing and only invite confusion, so they are
+    /// put away under the heading, which says why. With coding off or a stripe, tabs leave their
+    /// colors to these rows.
+    let mutable colorRows : SettingsRow list = []
+    let mutable colorsSection : Control list = []
+    let updateFilled() =
+        let filled = isFilled()
+        for row in colorRows do row.Collapsed <- filled
+        for part in colorsSection do part.Visible <- not filled
+        codingNote.Visible <- filled
+        updateContrastNote (activePalette settings.appearance)
+    let refresh() =
+        refreshing <- true
+        try
+            editingDark <- ThemeService.currentIsDark()
+            preview.Position <- match settings.getValue("tabPosition") :?> string with "Left" -> TabDockLeft | "Right" -> TabDockRight | _ -> TabDockTop
+            preview.ColumnWidth <- settings.getValue("tabColumnWidth") :?> int
+            columnWidth.Value <- decimal preview.ColumnWidth
+            let settings = settings.appearance
+            let palette = activePalette settings
+            // A preset with changed colours says so, in the list and when chosen.
+            ThemePresets.names |> Array.iteri(fun index name ->
+                let label = if settings.presetEdits.ContainsKey(editKey index) then tr (Strings.Appearance.editedPreset (tr name)) else tr name
+                preset.SetItemText(index,label))
+            preset.ItemColors <- Array.append (Array.init ThemePresets.names.Length (fun index -> (presetPalette settings index).tabNormalBgColor))
+                                              [|(customForProfile settings).tabNormalBgColor|]
+                                 |> Array.map(ThemePresets.previewColor editingDark)
+            preset.SelectedIndex <- selection settings |> Option.defaultValue ThemePresets.names.Length
+            for key,read,write,editor in colors do
+                editor.value <- box(read palette)
+            updateContrastNote palette
+            let geometry = settings.geometry
+            tabStyle.SelectedIndex <- TabStyle.names |> List.findIndex ((=) (TabStyle.serialize geometry.style))
+            for key,read,write,editor in dimensions do
+                let value = decimal (read geometry)
+                // Opening the page must not rewrite a legacy out-of-range value.
+                editor.Minimum <- min editor.Minimum value
+                editor.Maximum <- max editor.Maximum value
+                editor.Value <- value
+            // One height for any usual tab height: the window below the tabs gives up the room.
+            // Only tabs too tall to leave its toolbar visible make the panel grow.
+            let tabHeight = ThemeService.currentAppearance().scaled.tabHeight
+            preview.Height <- if preview.Position=TabDockTop then max (Dpi.scale 145) (tabHeight+Dpi.scale 56+2)
+                              else max (Dpi.scale 145) ((preview.TabBounds tabHeight).Bottom+Dpi.scale 14)
+            // A reset with nothing to undo would do nothing visible, so it is not offered.
+            resetColorsButton.Offered <-
+                match selection settings with
+                | Some index -> values palette<>values (original index)
+                | None -> true
+            resetLayoutButton.Offered <- geometry<>Theme.defaultGeometry || preview.ColumnWidth<>SettingsCatalog.columnWidthDefault
+            let frame = Some(SettingsColors.current(),editingDark,settings.geometry,preview.Position,preview.ColumnWidth)
+            if frame=previewFrame then preview.Invalidate(previewTabs())
+            else
+                previewFrame <- frame
+                preview.Invalidate()
+        finally refreshing <- false
+
+    do
+        SettingsUi.section table (tr Strings.Settings.theme.caption)
+        SettingsUi.add table (SettingsBindings.themeTiles())
+        SettingsUi.add table preview
+        preview.Paint.Add(fun e ->
+            let p = SettingsColors.current()
+            let dark = ThemeService.currentIsDark()
+            e.Graphics.SmoothingMode <- Drawing2D.SmoothingMode.AntiAlias
+            use frame = SettingsShapes.rounded (SettingsShapes.outlineRect preview.Width preview.Height) (float32(Dpi.scale 10))
+            use frameFill = new SolidBrush(if dark then Color.FromRGB(0x343432) else Color.FromRGB(0xE8E8E5))
+            use border = new Pen(p.border)
+            e.Graphics.FillPath(frameFill,frame)
+            e.Graphics.DrawPath(border,frame)
+            let appearance = ThemeService.currentAppearance().scaled
+            let appearance = if preview.Position=TabDockTop then appearance else {appearance with tabHeight=max (Dpi.scale 32) appearance.tabHeight}
+            let tabs = previewTabs()
+            let vertical = preview.Position<>TabDockTop
+            let left,top = Dpi.scale 16,Dpi.scale 14
+            let width = max 1 (preview.ClientSize.Width-Dpi.scale 32)
+            let bodyTop = if vertical then top else tabs.Bottom
+            // The panel keeps one height; taller tabs leave less room for the window below them.
+            let bodyHeight = max 0 (preview.Height-bodyTop-Dpi.scale 14)
+            let fill color (rect:Rectangle) =
+                use brush = new SolidBrush(color)
+                e.Graphics.FillRectangle(brush,rect)
+            let contentColor = if dark then Color.FromRGB(0x202020) else Color.White
+            let chromeColor = if dark then Color.FromRGB(0x292929) else Color.FromRGB(0xF3F3F1)
+            let placeholderColor = if dark then Color.FromRGB(0x555552) else Color.FromRGB(0xC8C8C3)
+            let state = e.Graphics.Save()
+            e.Graphics.SetClip(Rectangle(left,bodyTop,width,bodyHeight+1))
+            fill contentColor (Rectangle(left,bodyTop,width,bodyHeight))
+            let toolbarHeight = Dpi.scale 28
+            fill chromeColor (Rectangle(left,bodyTop,width,toolbarHeight))
+            fill placeholderColor (Rectangle(left+Dpi.scale 12,bodyTop+Dpi.scale 13,min (Dpi.scale 180) (width/2),Dpi.scale 7))
+            let sidebarWidth = min (Dpi.scale 128) (width/3)
+            fill chromeColor (Rectangle(left,bodyTop+toolbarHeight,sidebarWidth,bodyHeight-toolbarHeight))
+            for index in 0..1 do
+                let bounds = Rectangle(left+Dpi.scale 6,bodyTop+toolbarHeight+Dpi.scale (3+index*24),sidebarWidth-Dpi.scale 12,Dpi.scale 23)
+                if index=1 then fill p.selection bounds
+                fill placeholderColor (Rectangle(bounds.X+Dpi.scale 8,bounds.Y+Dpi.scale 10,
+                                                 max 1 (bounds.Width-Dpi.scale (26+index*8)),Dpi.scale 6))
+            for index in 0..1 do
+                let x = left+sidebarWidth+Dpi.scale 16
+                let y = bodyTop+toolbarHeight+Dpi.scale (3+index*24)
+                fill placeholderColor (Rectangle(x,y+Dpi.scale 4,Dpi.scale 16,Dpi.scale 17))
+                fill placeholderColor (Rectangle(x+Dpi.scale 28,y+Dpi.scale 9,
+                                                 min (Dpi.scale (150-index*24)) (max 1 (width-sidebarWidth-Dpi.scale 64)),Dpi.scale 7))
+            e.Graphics.DrawRectangle(border,left,bodyTop,width-1,bodyHeight)
+            e.Graphics.DrawLine(border,left,bodyTop+toolbarHeight,left+width-1,bodyTop+toolbarHeight)
+            e.Graphics.Restore(state)
+            // The font real tabs use, so the preview shrinks its text with short tabs too.
+            use font = TabMetrics.font appearance.tabHeight FontStyle.Regular
+            let info index (caption:string) : TabDisplayInfo = {
+                tint=(if settings.getValue("tabColorMode") :?> string = "Off" then None else Some((Theme.tabPalette (Theme.darkBar appearance.tabNormalBgColor)).[index])); colorStyle=settings.getValue("tabColorStyle") :?> string; numberBadge=None; initials=None; bgColor=None; text=caption; icon=SystemIcons.Application
+                textFont=font; textBrush=SystemBrushes.MenuText }
+            let ts : TabStripSprite<int> = {
+                tabs=Map2(List2([1,info 1 (tr Strings.Settings.tabActiveBgColor.caption);2,info 2 (tr Strings.Settings.tabHighlightBgColor.caption);3,info 4 (tr Strings.Settings.tabNormalBgColor.caption)]))
+                lorder=List2([1;2;3]);zorder=List2([1;2;3]);size=Sz(tabs.Width,tabs.Height)
+                slide=None;direction=(if vertical then TabDown else TabUp);alignment=TabLeft;onlyIcons=(vertical && preview.ColumnWidth=fst SettingsCatalog.columnWidthRange);transparent=true;held=None;centerShift=0.0; dock=preview.Position; scrollOffset=0; header=false
+                appearance=appearance;hover=Some(2,TabBackground);captured=None }
+            use bitmap = ts.render.bitmap
+            e.Graphics.DrawImageUnscaled(bitmap,tabs.Left,tabs.Top))
+        // Beside the preview, which shows the change at once.
+        let styleCard = new SettingsCard()
+        SettingsUi.add table styleCard
+        SettingsUi.settingRow styleCard "tabStyle" tabStyle
+        // Which tabs get a color and how it shows, side by side in one row. Search still finds
+        // each list by its own setting.
+        let colorMode = SettingsBindings.choice "tab-color-mode" [|tr Strings.Settings.colorsOff;tr Strings.Settings.byWindow;tr Strings.Settings.byApp|]
+        let colorStyle = SettingsBindings.choice "tab-color-style" [|tr Strings.Settings.fill;tr Strings.Settings.stripe|]
+        let coloring = new FlowLayoutPanel(AutoSize=true,AutoSizeMode=AutoSizeMode.GrowAndShrink,WrapContents=false,
+                                           Margin=Padding.Empty,Padding=Padding.Empty)
+        colorMode.Margin <- Padding.Empty
+        colorStyle.Margin <- Padding(Dpi.scale 8,0,0,0)
+        coloring.Controls.Add(colorMode)
+        coloring.Controls.Add(colorStyle)
+        SettingsUi.settingRow styleCard "tab-color-mode" coloring
+        coloring.Name <- "tab-color-coding"
+        colorMode.Name <- "tab-color-mode"
+        colorMode.AccessibleName <- tr Strings.Settings.tabColorMode.caption
+        colorMode.AccessibleDescription <- coloring.AccessibleDescription
+        colorStyle.Name <- "tab-color-style"
+        colorStyle.AccessibleName <- tr Strings.Settings.tabColorStyle.caption
+        for choice in [colorMode;colorStyle] do choice.SelectedIndexChanged.Add(fun _ -> preview.Invalidate(); updateFilled())
+        preset.Name <- "palette-preset"
+        preset.AccessibleName <- tr Strings.Appearance.colorPreset
+        preset.Width <- Dpi.scale 140
+        resetColorsButton.Margin <- Padding(0,0,Dpi.scale 6,0)
+        // The theme tiles above show which theme's colours these are.
+        SettingsUi.sectionHeading table (tr Strings.Appearance.tabColors) [resetColorsButton;preset]
+        preset.SelectedIndexChanged.Add(fun _ ->
+            if not refreshing && preset.SelectedIndex>=0 then
+                let index = preset.SelectedIndex
+                if index<ThemePresets.names.Length then choosePreset index else chooseCustom())
+        codingNote.MaximumSize <- Size(Dpi.scale 700,0)
+        SettingsUi.add table codingNote
+        let colorsCard = new SettingsCard()
+        SettingsUi.add table colorsCard
+        colorRows <-
+            [ for key,read,write,editor in colors do
+                yield SettingsUi.settingRowControl colorsCard key editor.control ]
+        colorsSection <- [resetColorsButton;preset;colorsCard]
+        contrastNote.MaximumSize <- Size(Dpi.scale 700,0)
+        SettingsUi.add table contrastNote
+        SettingsUi.add table contrastComparison
+        resetColorsButton.Click.Add(fun _ -> resetColors())
+        SettingsUi.sectionHeading table (tr Strings.Appearance.tabLayout) [resetLayoutButton]
+        let layoutCard = new SettingsCard()
+        SettingsUi.add table layoutCard
+        for key,read,write,editor in dimensions do SettingsUi.settingRow layoutCard key editor
+        SettingsUi.settingRow layoutCard "tabColumnWidth" columnWidth
+        columnWidth.ValueChanged.Add(fun _ ->
+            if not refreshing then settings.setValue("tabColumnWidth",box(int columnWidth.Value)))
+        resetLayoutButton.Click.Add(fun _ ->
+            update Theme.resetLayout
+            settings.setValue("tabColumnWidth",box SettingsCatalog.columnWidthDefault))
+        updateFilled()
+        refresh()
+        tabStyle.SelectedIndexChanged.Add(fun _ ->
+            if not refreshing && tabStyle.SelectedIndex>=0 then
+                let style = TabStyle.parse TabStyle.names.[tabStyle.SelectedIndex]
+                update(fun s -> {s with geometry={s.geometry with style=style}}))
+        for key,read,write,editor in colors do
+            editor.changed.Add(fun () ->
+                if not refreshing then
+                    editPalette(write (editor.value :?> Color)))
+        for key,read,write,editor in dimensions do
+            editor.ValueChanged.Add(fun _ ->
+                if not refreshing then
+                    update(fun s -> {s with geometry=write (int editor.Value) s.geometry}))
+        ThemeBinding.watch panel refresh
+        let subscriptions =
+            ["tabPosition";"tabColumnWidth"] |> List.map(fun key ->
+                settings.notifyValue key (fun _ ->
+                    if not panel.IsDisposed && panel.IsHandleCreated then
+                        try panel.BeginInvoke(Action(fun () -> if not panel.IsDisposed then refresh())) |> ignore
+                        with :? InvalidOperationException -> ()))
+        panel.Disposed.Add(fun _ -> subscriptions |> List.iter(fun subscription -> subscription.Dispose()))
+
+    interface ISettingsView with
+        member _.key = AppearanceSettings
+        member _.title = tr Strings.Pages.appearance
+        member _.control = panel :> Control
