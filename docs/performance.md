@@ -790,3 +790,17 @@ the previous code in 18 states (built, switched, rescaled, shown after a rescale
 a resize while hidden, collapsed rows, dark theme, 20 round trips), and all deterministic
 `SettingsTheme`, `SettingsEditors` and `DpiLayout` PNGs were pixel-identical. High
 contrast was not rendered, as it needs a system setting; the change does not touch colours.
+
+## Slow desktop
+
+When the whole desktop turns sluggish, run this before restarting anything:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/Measure-WindowEvents.ps1 -DurationSeconds 60
+```
+
+It counts window move, reorder and foreground events per window, with IDE-tabs CPU time,
+in each 5-second interval, and saves the report under `tests/Debug/window-events/`. A
+placement loop shows up as the same windows moving hundreds of times an interval while
+IDE-tabs uses CPU; a window that keeps appearing shows up as new handles each interval.
+It needs Windows PowerShell, not PowerShell 7.
