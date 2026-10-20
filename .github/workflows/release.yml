@@ -1,7 +1,7 @@
 name: release
 
-# Push a tag such as v0.1.0-alpha.1 to build, test and draft a GitHub release with a ZIP of
-# the unsigned exe and its SHA-256. The draft is reviewed and published by hand.
+# Push a tag such as v0.1.0-alpha.1 to build, test and draft a GitHub release with the per-user
+# setup, a portable ZIP of the unsigned exe and their SHA-256. The draft is reviewed and published by hand.
 on:
   push:
     tags: ['v*']
@@ -58,9 +58,19 @@ jobs:
           path: WtProgram/bin/Release/IDE-tabs.exe
           if-no-files-found: error
 
+      # Runner images usually carry Inno Setup 6; install it where one does not.
+      - name: Ensure Inno Setup
+        shell: powershell
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+
       - name: Package the release
         shell: powershell
         run: ./build/Package-Release.ps1 -Version ${{ steps.version.outputs.number }} -OutputDirectory dist
+
+      - name: Install, update and uninstall the setup
+        shell: powershell
+        run: ./tests/Run-InstallerSmoke.ps1 -Setup dist/IDE-tabs-${{ steps.version.outputs.number }}-setup.exe
 
       - name: Upload the release package
         uses: actions/upload-artifact@v6
@@ -150,5 +160,5 @@ jobs:
         run: |
           $flags = @('--draft', '--notes-file', 'dist/release-notes.md', '--title', "IDE-tabs $env:TAG", '--repo', '${{ github.repository }}')
           if ($env:TAG -match '^v\d+\.\d+\.\d+-') { $flags += '--prerelease' }
-          $files = @(Get-ChildItem dist -Filter *.zip | ForEach-Object FullName) + 'dist/SHA256SUMS.txt'
+          $files = @(Get-ChildItem dist/*-setup.exe, dist/*.zip | ForEach-Object FullName) + 'dist/SHA256SUMS.txt'
           gh release create $env:TAG @files @flags

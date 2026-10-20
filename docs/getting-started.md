@@ -1,17 +1,21 @@
 # Getting started
 
 IDE-tabs is an early alpha for **Windows 11**, supporting **Cursor** and **VS Code**. It
-needs no installation and no account.
+needs no account.
 
 ## Install
 
-1. Download the latest prerelease ZIP from
+1. Download `IDE-tabs-<version>-setup.exe` from the latest prerelease on
    [Releases](https://github.com/Pindaman77/IDE-tabs/releases). To check the download,
    compare its SHA-256 with `SHA256SUMS.txt` on the same page:
-   `Get-FileHash .\IDE-tabs-*.zip -Algorithm SHA256`.
-2. Unzip it to a folder of your own, for example `%LocalAppData%\Programs\IDE-tabs`.
-3. Run `IDE-tabs.exe`. The download is not code-signed yet, so Windows SmartScreen shows
+   `Get-FileHash .\IDE-tabs-*-setup.exe -Algorithm SHA256`.
+2. Run it. The download is not code-signed yet, so Windows SmartScreen shows
    **Windows protected your PC**: choose **More info → Run anyway**.
+3. The setup installs IDE-tabs for your account only, without administrator rights, to
+   `%LocalAppData%\Programs\IDE-tabs`, adds it to the Start menu and starts it.
+
+For a portable copy, download `IDE-tabs-<version>-windows.zip` instead, unzip it to a folder
+of your own and run `IDE-tabs.exe`.
 
 IDE-tabs starts in the system tray. On Windows 11 its icon may be under the **^** arrow
 next to the clock; drag it onto the taskbar to keep it in view.
@@ -56,12 +60,22 @@ change the sidebar shortcut, and choose whether it starts with Windows. They sav
 
 ## Update
 
-Quit IDE-tabs from the tray (right-click → **Quit IDE-tabs**), replace `IDE-tabs.exe` with
-the new one and start it again. Your settings are kept.
+Run the newer setup. It quits the running IDE-tabs, installs over it and starts it again;
+your editor windows stay open and your settings are kept. Moving from the ZIP to the setup
+works the same way: afterwards Windows starts the installed copy, and you can delete the
+unzipped folder.
+
+For the portable copy, quit IDE-tabs from the tray (right-click → **Quit IDE-tabs**),
+replace `IDE-tabs.exe` with the new one and start it again.
 
 ## Uninstall
 
+Open **Settings → Apps → Installed apps**, find **IDE-tabs** and choose **Uninstall**. It
+quits IDE-tabs, and your editor windows stay open and get their own taskbar buttons again.
+Your settings stay in `%AppData%\IDE-tabs`; delete that folder to remove them too.
+
+For the portable copy:
+
 1. Click the tray icon and turn off **Start with Windows**.
-2. Quit IDE-tabs from the tray. Your editor windows stay open and get their own taskbar
-   buttons again.
+2. Quit IDE-tabs from the tray.
 3. Delete the folder with `IDE-tabs.exe`, and `%AppData%\IDE-tabs` to remove your settings.

@@ -32,6 +32,21 @@ jobs:
         shell: powershell
         run: ./tests/Run-ReleaseSmoke.ps1
 
+      # Runner images usually carry Inno Setup 6; install it where one does not.
+      - name: Ensure Inno Setup
+        shell: powershell
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+
+      # The setup a release would carry, under the newest CHANGELOG version: installed, updated
+      # over a running copy and uninstalled.
+      - name: Package and smoke test the installer
+        shell: powershell
+        run: |
+          $version = (Select-String CHANGELOG.md -Pattern '^## v(\S+)' | Select-Object -First 1).Matches[0].Groups[1].Value
+          ./build/Package-Release.ps1 -Version $version -OutputDirectory dist
+          ./tests/Run-InstallerSmoke.ps1 -Setup "dist/IDE-tabs-$version-setup.exe"
+
       # Real input runs separately on an unlocked interactive desktop.
       - name: Compile desktop E2E harness
         shell: powershell
